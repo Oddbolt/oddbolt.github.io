@@ -1,0 +1,14 @@
+title: Oddbolt
+description: Small, independent apps.
+remote_theme: pages-themes/architect@v0.2.0
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+show_downloads: false
+contact_email: oddbolt.dev@gmail.com
+
+# Served as-is (no front matter): data/*.json, app-ads.txt.
+# Not part of the site:
+exclude:
+  - scripts
+  - README.md

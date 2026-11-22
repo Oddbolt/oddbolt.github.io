@@ -1,0 +1,9 @@
+{
+  "generatedAt": "2026-11-21",
+  "retailers": [
+    { "id": "bestbuy", "name": "Best Buy", "domain": "bestbuy.com", "region": "US", "currency": "USD" },
+    { "id": "walmart", "name": "Walmart", "domain": "walmart.com", "region": "US", "currency": "USD" },
+    { "id": "amazon", "name": "Amazon", "domain": "amazon.com", "region": "US", "currency": "USD" }
+  ],
+  "links": []
+}
