@@ -371,9 +371,9 @@
       "productId": "B0CJ3GHQXF",
       "directUrl": "https://www.amazon.com/dp/B0CJ3GHQXF",
       "affiliateUrl": null,
-      "directStatus": "unverified",
+      "directStatus": "ok",
       "affiliateStatus": "unverified",
-      "verifiedAt": null,
+      "verifiedAt": "2026-11-22",
       "method": "http"
     },
     {
