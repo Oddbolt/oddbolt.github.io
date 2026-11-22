@@ -6,12 +6,12 @@
  * For each link it loads the direct URL (and the affiliate URL, if any), following
  * redirects, and decides:
  *   ok      the page loaded and is still the same product (product ID in the final URL or page)
- *   broken  404/410, or the store redirected somewhere that isn't this product
- *   unknown the store blocked the check (403/429/503, captcha) or it timed out
+ *   broken  404/410, or the store redirected to a different page (search, homepage)
+ *   unknown anything else: blocked (403/429/503, captcha), timed out, or unclear
  *
- * "ok" refreshes verifiedAt to today. "unknown" changes nothing, so a link only stays
- * visible in the app if a check (or a manual verification, method "manual") succeeded
- * within the last 30 days. generatedAt changes only when something in the file changes.
+ * The app shows every link that isn't "broken", so "broken" must be certain; when in
+ * doubt the result is "unknown", which changes nothing. "ok" also clears an earlier
+ * "broken" and sets verifiedAt to today. generatedAt changes only when the file changes.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -47,7 +47,7 @@ const HEADERS = {
   Accept: 'text/html,application/xhtml+xml',
 };
 
-const BLOCKED_PAGE = /captcha|robot check|are you a human|px-captcha|access denied/i;
+const BLOCKED_PAGE = /captcha|robot check|robot or human|are you a human|px-captcha|access denied/i;
 
 type Probe = 'ok' | 'broken' | 'unknown';
 
@@ -56,14 +56,16 @@ async function probe(url: string, productId: string): Promise<Probe> {
     const response = await fetch(url, {
       redirect: 'follow',
       headers: HEADERS,
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(10000),
     });
     if (response.status === 404 || response.status === 410) return 'broken';
     if (!response.ok) return 'unknown';
     const body = await response.text();
     if (BLOCKED_PAGE.test(body)) return 'unknown';
-    if (!response.url.includes(productId) && !body.includes(productId)) return 'broken';
-    return 'ok';
+    if (response.url.includes(productId) || body.includes(productId)) return 'ok';
+    // Redirected away from the product page: the listing is gone.
+    if (response.redirected && !response.url.includes(productId)) return 'broken';
+    return 'unknown';
   } catch {
     return 'unknown';
   }
