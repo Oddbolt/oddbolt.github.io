@@ -1,6 +1,0 @@
-{
-  "$comment": "Fixes applied on top of AmiiboAPI by scripts/snapshot-catalogue.mts. 'patch' changes fields of an existing id, 'remove' drops ids, 'add' inserts complete entries AmiiboAPI is missing (same shape as data/catalogue.json entries).",
-  "patch": {},
-  "remove": [],
-  "add": []
-}
