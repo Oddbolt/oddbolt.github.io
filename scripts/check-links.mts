@@ -11,7 +11,8 @@
  *
  * The app shows every link that isn't "broken", so "broken" must be certain; when in
  * doubt the result is "unknown", which changes nothing. "ok" also clears an earlier
- * "broken" and sets verifiedAt to today. generatedAt changes only when the file changes.
+ * "broken" and sets verifiedAt to today. The file is only rewritten when something
+ * changed; the Publish workflow sets generatedAt.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -96,7 +97,9 @@ async function main() {
       else if (affiliate === 'broken') link.affiliateStatus = 'broken';
     }
 
-    console.log(`${direct.padEnd(7)} ${link.retailerId.padEnd(8)} ${link.amiiboId} ${link.directUrl}`);
+    console.log(
+      `${direct.padEnd(7)} ${link.retailerId.padEnd(8)} ${link.amiiboId} ${link.directUrl}`,
+    );
     await sleep(1500); // be polite to the stores
   }
 
@@ -105,7 +108,6 @@ async function main() {
     console.log('No changes.');
     return;
   }
-  file.generatedAt = today;
   writeFileSync(LINKS_PATH, `${JSON.stringify(file, null, 2)}\n`);
   console.log(`Updated ${LINKS_PATH}`);
 }

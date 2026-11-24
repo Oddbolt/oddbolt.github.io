@@ -6,7 +6,7 @@ description: What information the Amiibo Companion app handles.
 
 # Amiibo Companion Privacy Policy
 
-*Effective November 22, 2026*
+*Effective November 24, 2026*
 
 This policy explains what information the Amiibo Companion Android app ("the app"), made by Oddbolt ("we"), handles. In short: there is no account, your collection stays on your phone, and we don't collect or sell your personal information. The app shows ads provided by Google AdMob, which collects some device information as described below.
 
@@ -24,7 +24,7 @@ When you export a backup, the app creates a file containing your collection, wis
 
 ## Data the app downloads
 
-The app downloads the amiibo catalogue, store links, and amiibo images from servers hosted by GitHub (oddbolt.github.io and raw.githubusercontent.com). Like any web request, these include your IP address and basic technical information, which GitHub may log under the [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement). We do not receive or store this information.
+The app downloads the amiibo catalogue, store links, and amiibo images from our website, oddbolt.github.io, which is hosted by GitHub. If our website can't be reached, it downloads the same files from the jsDelivr content network (cdn.jsdelivr.net), and as a last resort loads amiibo images from GitHub (raw.githubusercontent.com). Like any web request, these include your IP address and basic technical information, which these services may log under the [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) and the [jsDelivr Privacy Policy](https://www.jsdelivr.com/privacy-policy-jsdelivr-net). We do not receive or store this information.
 
 ## Advertising
 
