@@ -419,6 +419,26 @@ async function reviewCard(pr) {
     card.append(h('pre', {}, pr.body || '(no description)'));
   }
   const files = await gh(repoPath(`/pulls/${pr.number}/files?per_page=100`));
+  if (files.some((file) => file.filename === 'data/catalogue.json')) {
+    const holder = h('div');
+    const button = h('button', {
+      type: 'button',
+      class: 'ghost',
+      onclick: async () => {
+        button.disabled = true;
+        button.textContent = 'Loading preview…';
+        try {
+          holder.replaceChildren(await appPreview(pr.head.ref));
+          button.remove();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = 'Preview in the app';
+          toast(`Couldn’t build the preview: ${error.message}`, true);
+        }
+      },
+    }, 'Preview in the app');
+    card.append(h('h3', {}, 'Preview'), button, holder);
+  }
   card.append(
     h('h3', {}, `Files (${files.length})`),
     h('ul', { class: 'list small' }, files.slice(0, 30).map((file) =>
@@ -463,6 +483,90 @@ async function closePr(pr) {
   } catch (error) {
     toast(`Couldn’t close: ${error.message}`, true);
   }
+}
+
+// ─── App preview ────────────────────────────────────────────────────
+
+const APP_REGIONS = [['na', 'North America'], ['eu', 'Europe'], ['jp', 'Japan'], ['au', 'Australia']];
+
+/** Formats YYYY-MM-DD like the app does ("Dec 4, 2025"), or "Not released". */
+function appDate(date) {
+  if (!date) return 'Not released';
+  return new Date(`${date}T00:00:00Z`).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
+/**
+ * How the amiibo a pull request adds or changes will look in the app: Discover-style
+ * tiles, and the detail page when one is tapped. Uses the PR's own data and images.
+ */
+async function appPreview(ref) {
+  const [proposed, current] = await Promise.all([fileJson('data/catalogue.json', ref), loadCatalogue(true)]);
+  const before = new Map(current.amiibo.map((entry) => [entry.id, entry]));
+  const aliasOf = new Map();
+  for (const entry of current.amiibo) for (const alias of entry.aliases || []) aliasOf.set(alias, entry.id);
+  const items = [];
+  for (const entry of proposed.amiibo) {
+    const old = before.get(entry.id) || (entry.aliases || []).map((alias) => before.get(alias)).find(Boolean);
+    if (!old) items.push({ entry, kind: 'New', changes: [] });
+    else {
+      const changes = describeDiff(old, entry);
+      if (old.id !== entry.id) changes.unshift(`id: ${old.id} → ${entry.id}`);
+      if (changes.length) items.push({ entry, kind: 'Changed', changes });
+    }
+  }
+  const removed = current.amiibo.filter((entry) => !proposed.amiibo.some((p) => p.id === entry.id || (p.aliases || []).includes(entry.id)));
+  if (!items.length && !removed.length) return h('p', { class: 'muted small' }, 'No amiibo are added or changed by this pull request.');
+
+  // Images: the PR's own file first (not published yet), then its fallback URL.
+  const imageFor = async (entry) => {
+    const img = h('img', { class: 'app-image', alt: entry.name });
+    try {
+      const blob = await gh(repoPath(`/contents/${entry.image}?ref=${encodeURIComponent(ref)}`), { accept: 'application/vnd.github.raw+json', as: 'blob' });
+      img.src = URL.createObjectURL(blob);
+    } catch {
+      if (entry.imageFallback) img.src = entry.imageFallback;
+      else img.alt = 'No image';
+    }
+    return img;
+  };
+  const images = new Map(await Promise.all(items.map(async (item) => [item.entry.id, await imageFor(item.entry)])));
+
+  const phone = h('div', { class: 'phone' });
+  const showGrid = () => {
+    phone.replaceChildren(
+      h('div', { class: 'app-title' }, 'Discover'),
+      h('div', { class: 'app-sub' }, `${items.length} amiibo in this pull request${removed.length ? ` · ${removed.length} removed` : ''}`),
+      h('div', { class: 'app-grid' }, items.map((item) =>
+        h('button', { type: 'button', class: 'app-tile', onclick: () => showDetail(item) },
+          h('div', { class: 'app-tile-image' }, images.get(item.entry.id).cloneNode(), h('span', { class: `app-badge ${item.kind === 'New' ? 'new' : 'changed'}` }, item.kind), h('span', { class: 'app-add' }, '+')),
+          h('div', { class: 'app-tile-name' }, item.entry.name),
+          h('div', { class: 'app-tile-series' }, item.entry.amiiboSeries)))),
+      ...(removed.length ? [h('div', { class: 'app-removed' }, `Removed: ${removed.map((entry) => entry.name).join(', ')}`)] : []),
+    );
+  };
+  const row = (label, value) => h('div', { class: 'app-row' }, h('span', {}, label), h('span', {}, value));
+  const showDetail = (item) => {
+    const { entry } = item;
+    phone.replaceChildren(
+      h('button', { type: 'button', class: 'app-back', onclick: showGrid }, '‹ Discover'),
+      h('div', { class: 'app-hero' }, images.get(entry.id).cloneNode()),
+      h('div', { class: 'app-name' }, entry.name),
+      h('div', { class: 'app-sub' }, `${entry.amiiboSeries} · ${entry.type}`),
+      h('div', { class: 'app-actions' }, h('span', { class: 'app-primary' }, 'Add to collection'), h('span', { class: 'app-heart' }, '♡')),
+      h('div', { class: 'app-section' }, 'DETAILS'),
+      h('div', { class: 'app-card' },
+        row('Character', entry.character), row('amiibo series', entry.amiiboSeries), row('Game series', entry.gameSeries), row('Type', entry.type)),
+      h('div', { class: 'app-section' }, 'RELEASE DATES'),
+      h('div', { class: 'app-card' }, APP_REGIONS.map(([key, label]) => row(label, appDate(entry.release[key])))),
+      h('div', { class: 'app-note' },
+        entry.id.startsWith('ob-') ? `Temporary id ${entry.id} (real id not known yet)` : `id ${entry.id}`,
+        item.changes.length ? h('div', {}, `Changes: ${item.changes.join('; ')}`) : null),
+    );
+  };
+  showGrid();
+  return h('div', { class: 'stack' },
+    h('p', { class: 'small muted' }, 'Roughly how these look in the app (dark theme). Tap a tile for its page. Nothing is live until you merge.'),
+    phone);
 }
 
 // ─── Runs (SNM reports) ────────────────────────────────────────────
