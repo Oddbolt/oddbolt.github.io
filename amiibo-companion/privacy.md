@@ -26,11 +26,10 @@ If Android backup is on, Android may include this data in your Google account ba
 | --- | --- | --- |
 | Camera | Only when you choose to take a photo of a copy | Saved in the app's private storage on your phone. Never uploaded. |
 | Photos | Only when you choose existing photos (system photo picker) | Copied into the app's private storage on your phone. Never uploaded. |
-| NFC | Only while the Scan screen is open and you hold an amiibo to your phone | Reads the amiibo's ID to identify it. Processed on your phone, never uploaded. |
 
 ## 3. Files you export or share
 
-Exporting a backup creates a file with your collection, wishlist, settings, and photos. Exporting a spreadsheet (CSV) creates a file with your collection and wishlist. Sharing a collection card creates an image of your completion and recent additions. Each opens your phone's share sheet: you choose where it goes, such as Google Drive, Files, or a messaging app, and that service's privacy policy applies.
+Exporting a backup creates a file with your collection, wishlist, settings, and photos. Exporting a spreadsheet (CSV) creates a file with your collection and wishlist. Each opens your phone's share sheet: you choose where it goes, such as Google Drive or Files, and that service's privacy policy applies.
 
 ## 4. Third-party services
 
