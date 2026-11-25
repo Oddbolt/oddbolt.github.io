@@ -7,12 +7,6 @@ plugins:
 show_downloads: false
 contact_email: oddbolt.dev@gmail.com
 
-# Served as-is (no front matter): data/*.json, images/, app-ads.txt.
 # Not part of the site:
 exclude:
-  - scripts
   - README.md
-  - package.json
-  - package-lock.json
-  - node_modules
-  - sync-report.md
