@@ -611,6 +611,11 @@ async function reviewCard(pr) {
   const checks = await gh(repoPath(`/commits/${pr.head.sha}/check-runs`)).catch(() => ({ check_runs: [] }));
   const checkPills = checks.check_runs.map((run) =>
     pill(`${run.name}: ${run.conclusion || run.status}`, run.conclusion === 'success' ? 'ok' : run.conclusion === 'failure' ? 'error' : 'warn'));
+  const guardRun = await latestGuardRun(pr.head.sha).catch(() => null);
+  if (guardRun && !checks.check_runs.some((run) => /guard/i.test(run.name))) {
+    const result = guardRun.status === 'completed' ? guardRun.conclusion : guardRun.status;
+    checkPills.unshift(pill(`Guard: ${result}`, result === 'success' ? 'ok' : result === 'failure' ? 'error' : 'warn'));
+  }
   const tool = toolForBranch(pr.head.ref);
   card.append(
     h('div', { class: 'row spread' },
@@ -657,19 +662,57 @@ async function reviewCard(pr) {
     h('ul', { class: 'list small' }, files.slice(0, 30).map((file) =>
       h('li', {}, `${file.status} ${file.filename} (+${file.additions} −${file.deletions})`))),
     h('div', { class: 'row' },
-      h('button', { type: 'button', onclick: () => mergePr(pr, checks.check_runs, guardOutcome) }, 'Merge'),
+      h('button', { type: 'button', onclick: () => mergePr(pr, files, guardOutcome) }, 'Merge'),
       h('button', { type: 'button', class: 'ghost', onclick: () => closePr(pr) }, 'Close without merging')),
   );
   return card;
 }
 
-async function mergePr(pr, checkRuns, guardOutcome) {
-  const guardRun = checkRuns.find((run) => /guard/i.test(run.name));
-  if (guardRun?.conclusion === 'failure' || (guardOutcome && guardOutcome !== 'success')) {
+/** Files the Guard protects: a pull request touching any of them must pass it to be merged here. */
+const GUARDED_PATH = /^(data|images|meta)\//;
+
+/**
+ * Newest Guard workflow run for a commit, or null if none has started. Read through the
+ * Actions API, which the dashboard token can use (the checks API needs a Checks permission).
+ * Adding a label re-runs the Guard, so the newest run is the one that counts.
+ */
+async function latestGuardRun(sha) {
+  const data = await gh(repoPath(`/actions/workflows/guard.yml/runs?head_sha=${encodeURIComponent(sha)}&per_page=20`));
+  return data.workflow_runs.sort((a, b) => b.id - a.id)[0] || null;
+}
+
+/**
+ * Merges only when the Guard has passed. Fails closed: a data pull request with no Guard
+ * result yet (the check hasn't started, or a tool's report is missing) isn't merged.
+ */
+async function mergePr(pr, files, toolGuardOutcome) {
+  // Read now, not when the card was drawn: the Guard may have finished (or re-run) since.
+  let guardRun;
+  try {
+    guardRun = await latestGuardRun(pr.head.sha);
+  } catch (error) {
+    return toast(`Couldn’t read the Guard check: ${error.message}`, true);
+  }
+  const checkRuns = (await gh(repoPath(`/commits/${pr.head.sha}/check-runs?per_page=100`)).catch(() => null))?.check_runs || [];
+  const tool = toolForBranch(pr.head.ref);
+  // 100 = the most the files list returns, so there may be data files beyond it.
+  const touchesData = files.length >= 100 || files.some((file) => GUARDED_PATH.test(file.filename));
+
+  // The tools open their pull requests as GitHub Actions, which doesn't start the Guard
+  // workflow, so they run the Guard themselves and their report has the result.
+  const results = [];
+  if (tool?.reports) results.push(toolGuardOutcome || 'no report');
+  if (guardRun) results.push(guardRun.status === 'completed' ? guardRun.conclusion : 'running');
+  if (touchesData && results.length === 0) results.push('not started');
+
+  if (results.includes('no report')) {
+    return toast('Couldn’t find the report for this run, so the Guard result is unknown. Review it on GitHub.', true);
+  }
+  if (results.some((result) => !['success', 'running', 'not started'].includes(result))) {
     return toast('The Guard check failed for this pull request, so the dashboard won’t merge it. Review it on GitHub.', true);
   }
-  if (guardRun && !guardRun.conclusion) {
-    return toast('The Guard check is still running. Try again in a minute.', true);
+  if (results.includes('running') || results.includes('not started')) {
+    return toast(`The Guard check ${results.includes('running') ? 'is still running' : 'hasn’t started yet'}. Try again in a minute.`, true);
   }
   const failing = checkRuns.filter((run) => run.conclusion === 'failure');
   const pending = checkRuns.filter((run) => !run.conclusion);
