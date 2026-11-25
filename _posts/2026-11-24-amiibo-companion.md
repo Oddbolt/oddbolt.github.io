@@ -2,8 +2,6 @@
 title: Amiibo Companion
 description: A collection tracker for amiibo collectors, for Android.
 date: 2026-11-24 12:00:00 -0500
-categories: [Apps]
-tags: [android, amiibo]
 pin: true
 permalink: /amiibo-companion/
 ---
