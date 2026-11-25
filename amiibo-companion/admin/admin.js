@@ -1,15 +1,80 @@
-// Data Admin: monitors SNM and the data repository, and makes changes only as pull
-// requests (merging stays a separate, deliberate step). Talks to api.github.com with the
-// token you enter; it holds no data or secrets of its own.
+// Remote Admin (Amiibo Companion), served at /amiibo-companion/admin/: runs and monitors the data tools, reviews their pull
+// requests, and edits the catalogue, always through pull requests (merging stays a
+// separate, deliberate step). Talks to api.github.com with the token you enter; it holds
+// no data or secrets of its own.
+//
+// Tools are listed in TOOLS below; a new tool (a GitHub workflow that saves its report on
+// the tool-reports branch) only needs an entry there.
 'use strict';
 
 const API = 'https://api.github.com';
 const CDN = 'https://oddbolt.github.io/amiibo-cdn';
-const REPORTS_BRANCH = 'snm-reports';
+const REPORTS_BRANCH = 'tool-reports';
+const PROVENANCE = 'meta/provenance.json';
+const PLACEHOLDER_IMAGE = 'images/placeholder.webp';
+
+/**
+ * The tools this dashboard runs. `reports: true` tools save a report per run under
+ * <id>/ on the tool-reports branch; `branch` is the pull request branch they open;
+ * `sections` names the lists in their report, in display order.
+ */
+const TOOLS = [
+  {
+    id: 'snm',
+    name: 'SNM',
+    title: 'SNM · Search New Model',
+    description: 'Finds amiibo we don’t have yet: AmiiboAPI and amiibo life first, Nintendo’s sites when those aren’t enough. Opens a pull request with the new amiibo.',
+    workflow: 'snm.yml',
+    reports: true,
+    branch: 'snm/update',
+    schedule: 'Runs Tuesdays',
+    options: [{ key: 'nintendo', label: 'Nintendo sites', values: ['auto', 'always', 'never'], help: 'auto = only when the databases aren’t enough' }],
+    sections: { added: 'New amiibo', promoted: 'Temporary ids replaced', ambiguous: 'Same name as more than one (not added)', unmatched: 'Not added', filled: 'Filled', conflicts: 'Sources disagree (not applied)' },
+    summary: (counts) => `${counts.added ?? 0} new`,
+  },
+  {
+    id: 'db-update',
+    name: 'Update Database',
+    title: 'Update Database',
+    description: 'Improves amiibo we already have from AmiiboAPI and amiibo life: fills empty fields and missing pictures, replaces guesses, fixes release dates both agree on. Never touches your edits.',
+    workflow: 'update-db.yml',
+    reports: true,
+    branch: 'db-update/update',
+    schedule: 'Runs when you start it',
+    options: [],
+    sections: { changes: 'Changes', disagreements: 'One source disagrees (not changed)', kept: 'Your edits kept' },
+    summary: (counts) => `${counts.changes ?? 0} changes`,
+  },
+  {
+    id: 'weekly',
+    name: 'Weekly update',
+    title: 'Weekly update',
+    description: 'Checks every store link, saves the results, then publishes.',
+    workflow: 'update-data.yml',
+    schedule: 'Runs Mondays',
+  },
+  {
+    id: 'publish',
+    name: 'Publish',
+    title: 'Publish',
+    description: 'Checks the data and puts it online for the app. Runs by itself after every merge.',
+    workflow: 'publish.yml',
+    schedule: 'Runs after every change',
+  },
+  {
+    id: 'links',
+    name: 'Store links model',
+    title: 'Store links model',
+    description: 'Planned: finds, checks and updates store and affiliate links, as pull requests.',
+    planned: true,
+  },
+];
+const toolById = (id) => TOOLS.find((tool) => tool.id === id);
+const toolForBranch = (ref) => TOOLS.find((tool) => tool.branch && ref === tool.branch);
 const EDITABLE = ['name', 'character', 'gameSeries', 'amiiboSeries', 'type', 'imageFallback'];
 const REGIONS = ['na', 'eu', 'jp', 'au'];
 
-const state = { token: '', repo: '', user: null, catalogue: null, provenance: null, tab: 'overview' };
+const state = { token: '', repo: '', user: null, catalogue: null, provenance: null, tab: 'home' };
 let currentHash = '';
 
 // ─── Small helpers ──────────────────────────────────────────────────
@@ -70,7 +135,7 @@ function link(text, href) {
 
 function view(...children) {
   const el = $('#view');
-  el.replaceChildren(...children);
+  el.replaceChildren(...children.flat().filter((child) => child !== null && child !== undefined && child !== false));
   return el;
 }
 
@@ -182,10 +247,15 @@ async function proposeChange({ branch, title, body, files, labels = [] }) {
     body: { ref: `refs/heads/${branch}`, sha: main.object.sha },
   });
   for (const file of files) {
-    const current = await gh(repoPath(`/contents/${file.path}?ref=${encodeURIComponent(branch)}`));
+    let sha;
+    try {
+      sha = (await gh(repoPath(`/contents/${file.path}?ref=${encodeURIComponent(branch)}`))).sha;
+    } catch (error) {
+      if (error.status !== 404) throw error; // a new file
+    }
     await gh(repoPath(`/contents/${file.path}`), {
       method: 'PUT',
-      body: { message: title, content: utf8ToBase64(file.text), sha: current.sha, branch },
+      body: { message: title, content: utf8ToBase64(file.text), branch, ...(sha ? { sha } : {}) },
     });
   }
   const pr = await gh(repoPath('/pulls'), {
@@ -214,11 +284,28 @@ async function loadCatalogue(force = false) {
   if (state.catalogue && !force) return state.catalogue;
   const [catalogue, provenance] = await Promise.all([
     fileJson('data/catalogue.json'),
-    fileJson('snm/provenance.json').catch(() => null),
+    fileJson(PROVENANCE).catch(() => null),
   ]);
   state.catalogue = catalogue;
   state.provenance = provenance || {};
   return catalogue;
+}
+
+/**
+ * Provenance with these fields marked as set by hand, so the tools leave them alone.
+ * Returns the file to add to a pull request.
+ */
+async function manualProvenanceFile(id, fields, previousId = null) {
+  const provenance = (await fileJson(PROVENANCE).catch(() => null)) || {};
+  if (previousId && provenance[previousId]) {
+    provenance[id] = { ...provenance[previousId], ...(provenance[id] || {}) };
+    delete provenance[previousId];
+  }
+  provenance[id] ??= {};
+  for (const field of fields) {
+    provenance[id][field] = { source: 'manual', url: null, retrievedAt: new Date().toISOString(), run: `dashboard:${state.user.login}` };
+  }
+  return { path: PROVENANCE, text: `${JSON.stringify(provenance, null, 2)}\n` };
 }
 
 function imageUrl(entry) {
@@ -271,7 +358,7 @@ async function signIn(token, repo, remember) {
   $('#signin').hidden = true;
   $('#tabs').hidden = false;
   $('#signout').hidden = false;
-  showTab(location.hash.slice(1) || 'overview');
+  showTab(location.hash.slice(1) || 'home');
 }
 
 function signOut() {
@@ -285,12 +372,12 @@ function signOut() {
 
 // ─── Tabs ───────────────────────────────────────────────────────────
 
-const TABS = { overview: showOverview, review: showReview, runs: showRuns, catalogue: showCatalogue, history: showHistory };
+const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, history: showHistory };
 
 function showTab(name, ...args) {
   const [tab, ...rest] = name.split('/');
-  if (args.length === 0 && rest.length) args = [decodeURIComponent(rest.join('/'))];
-  if (!TABS[tab]) return showTab('overview');
+  if (args.length === 0 && rest.length) args = rest.map((part) => decodeURIComponent(part));
+  if (!TABS[tab]) return showTab('home');
   state.tab = tab;
   for (const button of document.querySelectorAll('#tabs button')) {
     button.classList.toggle('active', button.dataset.tab === tab);
@@ -302,82 +389,155 @@ function showTab(name, ...args) {
   });
 }
 
-// ─── Overview ───────────────────────────────────────────────────────
+const stat = (label, value, note) =>
+  h('div', { class: 'card stat' }, h('div', { class: 'muted small' }, label), h('div', { class: 'value' }, value), note ? h('div', { class: 'small muted' }, note) : null);
 
-async function showOverview() {
+function runPill(run) {
+  if (!run) return pill('never run');
+  const result = run.conclusion || run.status;
+  return pill(result, result === 'success' ? 'ok' : result === 'failure' ? 'error' : 'warn');
+}
+
+/** Latest GitHub run of each tool's workflow. */
+function lastRuns(runs) {
+  const byFile = new Map();
+  for (const run of runs) {
+    const file = run.path?.split('/').pop();
+    if (file && !byFile.has(file)) byFile.set(file, run);
+  }
+  return byFile;
+}
+
+// ─── Home ───────────────────────────────────────────────────────────
+
+async function showHome() {
   loading();
-  const [latest, pulls, runs, issues, published] = await Promise.all([
-    fileJson('latest.json', REPORTS_BRANCH).catch(() => null),
-    gh(repoPath('/pulls?state=open&per_page=20')),
-    gh(repoPath('/actions/runs?per_page=12')),
-    gh(repoPath('/issues?state=open&per_page=20')),
+  const reportTools = TOOLS.filter((tool) => tool.reports);
+  const [pulls, runs, issues, published, ...latest] = await Promise.all([
+    gh(repoPath('/pulls?state=open&per_page=30')),
+    gh(repoPath('/actions/runs?per_page=40')),
+    gh(repoPath('/issues?state=open&per_page=30')),
     fetch(`${CDN}/data/catalogue.json`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    ...reportTools.map((tool) => fileJson(`${tool.id}/latest.json`, REPORTS_BRANCH).catch(() => null)),
   ]);
+  const latestById = Object.fromEntries(reportTools.map((tool, index) => [tool.id, latest[index]]));
   const openIssues = issues.filter((issue) => !issue.pull_request);
-  const stat = (label, value, note) =>
-    h('div', { class: 'card stat' }, h('div', { class: 'muted small' }, label), h('div', { class: 'value' }, value), note ? h('div', { class: 'small muted' }, note) : null);
+  const byFile = lastRuns(runs.workflow_runs);
 
-  const runRows = runs.workflow_runs.map((run) =>
-    h('tr', {},
-      h('td', {}, run.name),
-      h('td', {}, pill(run.conclusion || run.status, run.conclusion === 'success' ? 'ok' : run.conclusion === 'failure' ? 'error' : 'warn')),
-      h('td', { class: 'small muted' }, when(run.created_at)),
-      h('td', {}, link('Log', run.html_url)),
-    ),
-  );
+  const toolCard = (tool) => {
+    const run = tool.workflow ? byFile.get(tool.workflow) : null;
+    const report = latestById[tool.id];
+    const counts = report ? Object.fromEntries(Object.entries(report.sections || {}).map(([key, list]) => [key, list.length])) : {};
+    const waiting = tool.branch ? pulls.find((pr) => pr.head.ref === tool.branch) : null;
+    return h('div', { class: `card tool${tool.planned ? ' planned' : ''}` },
+      h('div', { class: 'row spread' }, h('h2', {}, tool.title), tool.planned ? pill('planned') : runPill(run)),
+      h('p', { class: 'small muted' }, tool.description),
+      tool.planned ? null : h('p', { class: 'small' },
+        report ? `Last report: ${tool.summary(counts)} · ${when(report.startedAt)}${report.dryRun ? ' · dry run' : ''}` : run ? `Last run ${when(run.created_at)}` : 'Not run yet',
+        tool.schedule ? ` · ${tool.schedule}` : ''),
+      waiting ? h('p', { class: 'small warn' }, `Pull request #${waiting.number} is waiting for review`) : null,
+      tool.planned ? null : h('div', { class: 'row' },
+        tool.reports
+          ? [h('button', { type: 'button', onclick: () => showTab(`tools/${tool.id}`) }, 'Open'),
+             h('button', { type: 'button', class: 'ghost', onclick: () => runTool(tool, true) }, 'Dry run')]
+          : h('button', { type: 'button', class: 'ghost', onclick: () => runTool(tool, false) }, `Run ${tool.name.toLowerCase()}`),
+        run ? link('Last log', run.html_url) : null));
+  };
 
   view(
     h('div', { class: 'grid' },
       stat('Published amiibo', published ? String(published.amiibo.length) : '?', published ? `Data from ${when(published.generatedAt)}` : 'Couldn’t read the public data'),
-      stat('Last SNM run', latest ? `${latest.added.length} new · ${latest.filled.length} filled` : 'None yet',
-        latest ? `${when(latest.startedAt)}${latest.dryRun ? ' · dry run' : ''} · guard ${latest.guard?.outcome || '?'}` : 'Run it from the Runs tab'),
-      stat('Waiting for review', String(pulls.length), pulls.length ? 'See the Review tab' : 'Nothing to merge'),
-      stat('Open issues', String(openIssues.length), openIssues.length ? 'Failures and reports below' : 'All clear'),
+      stat('Waiting for review', String(pulls.length), pulls.length ? 'See Review' : 'Nothing to merge'),
+      stat('Open issues', String(openIssues.length), openIssues.length ? 'Listed below' : 'All clear'),
     ),
-    h('div', { class: 'card' },
-      h('div', { class: 'row spread' }, h('h2', {}, 'Actions'), null),
-      h('div', { class: 'row' },
-        h('button', { type: 'button', onclick: () => runSnm(true) }, 'Run SNM (dry run)'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => runSnm(false) }, 'Run SNM and open PR'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => runWorkflow('publish.yml', 'Publish') }, 'Publish now'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => runWorkflow('update-data.yml', 'Weekly update') }, 'Run weekly update'),
-      ),
-    ),
+    h('h3', {}, 'Tools'),
+    h('div', { class: 'tool-grid' }, TOOLS.map(toolCard)),
     openIssues.length
       ? h('div', { class: 'card' }, h('h2', {}, 'Open issues'),
           h('ul', { class: 'list' }, openIssues.map((issue) =>
             h('li', { class: 'row spread' }, h('span', {}, `#${issue.number} ${issue.title}`), link('Open', issue.html_url)))))
       : null,
-    h('div', { class: 'card' }, h('h2', {}, 'Recent workflow runs'),
-      h('div', { class: 'table-wrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Workflow'), h('th', {}, 'Result'), h('th', {}, 'Started'), h('th', {}, ''))), h('tbody', {}, runRows)))),
+    h('div', { class: 'card' }, h('h2', {}, 'Recent workflow runs'), runsTable(runs.workflow_runs.slice(0, 12))),
   );
 }
 
-async function runSnm(dryRun) {
-  const ok = await confirmDialog(
-    dryRun ? 'Run SNM as a dry run?' : 'Run SNM and open a pull request?',
-    dryRun
+function runsTable(runs) {
+  return h('div', { class: 'table-wrap' }, h('table', {},
+    h('thead', {}, h('tr', {}, h('th', {}, 'Workflow'), h('th', {}, 'Result'), h('th', {}, 'Started'), h('th', {}, ''))),
+    h('tbody', {}, runs.map((run) =>
+      h('tr', {}, h('td', {}, run.name), h('td', {}, runPill(run)), h('td', { class: 'small muted' }, when(run.created_at)), h('td', {}, link('Log', run.html_url)))))));
+}
+
+/** Starts a tool's workflow. Report tools ask dry run vs pull request; options as chosen. */
+async function runTool(tool, dryRun, options = {}) {
+  const body = tool.reports
+    ? dryRun
       ? 'It reads the sources and saves a report. Nothing in the data changes.'
-      : 'It reads the sources and, if it finds anything, opens or updates the SNM pull request. Nothing changes until you merge it.',
-    'Run',
-  );
-  if (!ok) return;
+      : 'If it finds anything, it opens or updates its pull request. Nothing changes until you merge it.'
+    : 'It runs on GitHub with its usual checks.';
+  const title = tool.reports ? `${tool.name}: ${dryRun ? 'dry run' : 'run and open a pull request'}?` : `Run ${tool.name}?`;
+  if (!(await confirmDialog(title, body, 'Run'))) return;
+  const inputs = tool.reports ? { dry_run: dryRun ? 'true' : 'false', ...options } : {};
   try {
-    await dispatch('snm.yml', { dry_run: dryRun ? 'true' : 'false' });
-    toast('SNM started. Its report appears in Runs when it finishes (a few minutes).');
+    await dispatch(tool.workflow, inputs);
+    toast(`${tool.name} started.${tool.reports ? ' Its report appears under Tools when it finishes.' : ''}`);
   } catch (error) {
-    toast(`Couldn’t start SNM: ${error.message}`, true);
+    toast(`Couldn’t start ${tool.name}: ${error.message}`, true);
   }
 }
 
-async function runWorkflow(file, label) {
-  if (!(await confirmDialog(`Run ${label}?`, 'It runs on GitHub with its usual checks.', 'Run'))) return;
-  try {
-    await dispatch(file);
-    toast(`${label} started.`);
-  } catch (error) {
-    toast(`Couldn’t start ${label}: ${error.message}`, true);
+// ─── Tools ──────────────────────────────────────────────────────────
+
+async function showTools(toolId, kind, runId) {
+  if (!toolId) {
+    view(h('div', { class: 'tool-grid' }, TOOLS.map((tool) =>
+      h('div', { class: `card tool${tool.planned ? ' planned' : ''}` },
+        h('div', { class: 'row spread' }, h('h2', {}, tool.title), tool.planned ? pill('planned') : null),
+        h('p', { class: 'small muted' }, tool.description),
+        tool.planned ? null : h('button', { type: 'button', onclick: () => (tool.reports ? showTab(`tools/${tool.id}`) : runTool(tool, false)) }, tool.reports ? 'Open' : `Run ${tool.name.toLowerCase()}`)))));
+    return;
   }
+  const tool = toolById(toolId);
+  if (!tool || !tool.reports) return showTab('tools');
+  if (kind === 'run' && runId) return showRun(tool, runId);
+  loading();
+  const [index, runs] = await Promise.all([
+    fileJson(`${tool.id}/index.json`, REPORTS_BRANCH).catch(() => null),
+    gh(repoPath(`/actions/workflows/${tool.workflow}/runs?per_page=5`)).catch(() => ({ workflow_runs: [] })),
+  ]);
+  const list = index || [];
+  const selects = {};
+  const optionControls = (tool.options || []).map((option) => {
+    selects[option.key] = h('select', {}, option.values.map((value) => h('option', { value }, value)));
+    return h('label', {}, `${option.label} (${option.help})`, selects[option.key]);
+  });
+  const chosen = () => Object.fromEntries(Object.entries(selects).map(([key, select]) => [key, select.value]));
+  const sectionKeys = Object.keys(tool.sections);
+  const usedKeys = sectionKeys.filter((key) => list.some((run) => (run.counts?.[key] ?? 0) > 0) || ['added', 'changes'].includes(key));
+  view(
+    h('div', { class: 'card stack' },
+      h('div', { class: 'row spread' }, h('h2', {}, tool.title), h('button', { type: 'button', class: 'ghost', onclick: () => showTab('tools') }, 'All tools')),
+      h('p', { class: 'small muted' }, tool.description),
+      optionControls.length ? h('div', { class: 'fields' }, optionControls) : null,
+      h('div', { class: 'row' },
+        h('button', { type: 'button', onclick: () => runTool(tool, true, chosen()) }, 'Dry run'),
+        h('button', { type: 'button', class: 'ghost', onclick: () => runTool(tool, false, chosen()) }, 'Run and open PR'),
+        list.length ? h('button', { type: 'button', class: 'ghost', onclick: () => exportRuns(tool, list) }, 'Export recent runs') : null)),
+    runs.workflow_runs.length ? h('div', { class: 'card' }, h('h2', {}, 'On GitHub'), runsTable(runs.workflow_runs)) : null,
+    h('div', { class: 'card table-wrap' },
+      h('h2', {}, 'Reports'),
+      list.length === 0
+        ? h('p', { class: 'muted' }, 'No runs yet.')
+        : h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Started'), h('th', {}, 'Kind'), ...usedKeys.map((key) => h('th', {}, tool.sections[key])), h('th', {}, 'Errors'), h('th', {}, 'Guard'))),
+            h('tbody', {}, list.map((run) =>
+              h('tr', { class: 'clickable', onclick: () => showTab(`tools/${tool.id}/run/${run.runId}`) },
+                h('td', {}, when(run.startedAt)),
+                h('td', {}, run.dryRun ? pill('dry run') : pill('PR', 'ok')),
+                ...usedKeys.map((key) => h('td', {}, String(run.counts?.[key] ?? 0))),
+                h('td', {}, run.errors ? pill(String(run.errors), 'warn') : '0'),
+                h('td', {}, pill(run.guard, run.guard === 'success' ? 'ok' : 'error'))))))),
+  );
 }
 
 // ─── Review (open pull requests) ───────────────────────────────────
@@ -386,7 +546,7 @@ async function showReview() {
   loading();
   const pulls = await gh(repoPath('/pulls?state=open&per_page=30'));
   if (pulls.length === 0) {
-    view(h('div', { class: 'card' }, h('h2', {}, 'Nothing to review'), h('p', { class: 'muted' }, 'SNM, the weekly sync and your own edits open pull requests here.')));
+    view(h('div', { class: 'card' }, h('h2', {}, 'Nothing to review'), h('p', { class: 'muted' }, 'The tools and your own catalogue edits open pull requests here.')));
     return;
   }
   const cards = await Promise.all(pulls.map(reviewCard));
@@ -398,7 +558,7 @@ async function reviewCard(pr) {
   const checks = await gh(repoPath(`/commits/${pr.head.sha}/check-runs`)).catch(() => ({ check_runs: [] }));
   const checkPills = checks.check_runs.map((run) =>
     pill(`${run.name}: ${run.conclusion || run.status}`, run.conclusion === 'success' ? 'ok' : run.conclusion === 'failure' ? 'error' : 'warn'));
-  const isSnm = pr.head.ref === 'snm/update';
+  const tool = toolForBranch(pr.head.ref);
   card.append(
     h('div', { class: 'row spread' },
       h('h2', {}, `#${pr.number} ${pr.title}`),
@@ -409,11 +569,11 @@ async function reviewCard(pr) {
       ...checkPills),
   );
   let guardOutcome = null;
-  if (isSnm) {
-    const runId = (pr.body || '').match(/SNM run (\S+)/)?.[1];
-    const report = runId ? await fileJson(`reports/${runId}.json`, REPORTS_BRANCH).catch(() => null) : null;
+  if (tool?.reports) {
+    const runId = (pr.body || '').match(/\brun (\d+|local-\d+)/)?.[1];
+    const report = runId ? await fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH).catch(() => null) : null;
     guardOutcome = report?.guard?.outcome ?? null;
-    if (report) card.append(await reportDetails(report, pr.head.ref));
+    if (report) card.append(await reportDetails(tool, report, pr.head.ref));
     else card.append(h('pre', {}, pr.body || ''));
   } else {
     card.append(h('pre', {}, pr.body || '(no description)'));
@@ -569,80 +729,55 @@ async function appPreview(ref) {
     phone);
 }
 
-// ─── Runs (SNM reports) ────────────────────────────────────────────
+// ─── Reports ────────────────────────────────────────────────────────
 
-async function showRuns(runId) {
-  if (runId) return showRun(runId);
+async function showRun(tool, runId) {
   loading();
-  const index = (await fileJson('index.json', REPORTS_BRANCH).catch(() => null)) || [];
-  const rows = index.map((run) =>
-    h('tr', { class: 'clickable', onclick: () => showTab(`runs/${run.runId}`, run.runId) },
-      h('td', {}, when(run.startedAt)),
-      h('td', {}, run.dryRun ? pill('dry run') : pill('PR', 'ok')),
-      h('td', {}, String(run.added)),
-      h('td', {}, String(run.filled)),
-      h('td', {}, String(run.conflicts)),
-      h('td', {}, run.errors ? pill(String(run.errors), 'warn') : '0'),
-      h('td', {}, pill(run.guard, run.guard === 'success' ? 'ok' : 'error')),
-    ));
-  view(
-    h('div', { class: 'card row spread' },
-      h('div', {}, h('h2', {}, 'SNM runs'), h('p', { class: 'muted small' }, 'Every run saves a report, including dry runs.')),
-      h('div', { class: 'row' },
-        h('button', { type: 'button', onclick: () => runSnm(true) }, 'Dry run now'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => runSnm(false) }, 'Run and open PR'),
-        index.length ? h('button', { type: 'button', class: 'ghost', onclick: () => exportRuns(index) }, 'Export recent runs') : null)),
-    h('div', { class: 'card table-wrap' },
-      index.length === 0
-        ? h('p', { class: 'muted' }, 'No runs yet.')
-        : h('table', {}, h('thead', {}, h('tr', {}, ...['Started', 'Kind', 'New', 'Filled', 'Disagree', 'Errors', 'Guard'].map((t) => h('th', {}, t)))), h('tbody', {}, rows))),
-  );
-}
-
-async function showRun(runId) {
-  loading();
-  const report = await fileJson(`reports/${runId}.json`, REPORTS_BRANCH);
+  const report = await fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH);
   if (!report) throw new Error('Report not found.');
   view(
     h('div', { class: 'card stack' },
       h('div', { class: 'row spread' },
-        h('h2', {}, `SNM run ${when(report.startedAt)}`),
+        h('h2', {}, `${tool.name} run · ${when(report.startedAt)}`),
         h('div', { class: 'row' },
-          h('button', { type: 'button', class: 'ghost', onclick: () => showTab('runs') }, 'All runs'),
+          h('button', { type: 'button', class: 'ghost', onclick: () => showTab(`tools/${tool.id}`) }, `All ${tool.name} runs`),
           report.runUrl ? link('Log on GitHub', report.runUrl) : null)),
       h('div', { class: 'row' },
-        h('button', { type: 'button', onclick: () => copyText(reportToText(report)) }, 'Copy as text'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => download(`snm-run-${report.runId}.txt`, reportToText(report), 'text/plain') }, 'Download .txt'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => download(`snm-run-${report.runId}.json`, JSON.stringify(report, null, 2), 'application/json') }, 'Download .json')),
+        h('button', { type: 'button', onclick: () => copyText(reportToText(tool, report)) }, 'Copy as text'),
+        h('button', { type: 'button', class: 'ghost', onclick: () => download(`${tool.id}-run-${report.runId}.txt`, reportToText(tool, report), 'text/plain') }, 'Download .txt'),
+        h('button', { type: 'button', class: 'ghost', onclick: () => download(`${tool.id}-run-${report.runId}.json`, JSON.stringify(report, null, 2), 'application/json') }, 'Download .json')),
       h('p', { class: 'muted small' }, `${report.dryRun ? 'Dry run' : 'Pull request run'} · guard ${report.guard?.outcome || '?'}`),
-      await reportDetails(report, null)),
+      await reportDetails(tool, report, null)),
   );
 }
 
-// ─── Export ─────────────────────────────────────────────────────────
+/** One line of text for any report item (new amiibo, change, disagreement, …). */
+function itemText(item) {
+  if (typeof item === 'string') return item;
+  if (item.from !== undefined && item.to !== undefined && item.field) return `${item.name} | ${item.id} | ${item.field}: ${item.from ?? '(empty)'} → ${item.to} | ${item.source}${item.why ? `; ${item.why}` : ''}`;
+  if (item.from && item.to) return `${item.name}: ${item.from} → ${item.to}`;
+  if (item.ours !== undefined) return `${item.name} | ${item.id} | ${item.field}: ours ${item.ours}, ${item.source} says ${item.theirs}${item.url ? ` | ${item.url}` : ''}`;
+  if (item.value !== undefined && item.field) return `${item.name} | ${item.id} | ${item.field} = ${item.value} | ${item.source}`;
+  if (item.amiiboSeries && item.id) return `${item.name} | ${item.amiiboSeries} | ${item.id} | ${item.releaseDate || 'no date'} | ${item.image === 'placeholder' ? 'placeholder picture' : 'picture'}${item.sources ? ` | from ${item.sources.join(', ')}` : ''}${item.url ? ` | ${item.url}` : ''}${item.guessed?.length ? ` | check: ${item.guessed.join('; ')}` : ''}`;
+  return `${item.name}${item.series ? ` | ${item.series}` : ''}${item.releaseDate ? ` | ${item.releaseDate}` : ''} | ${item.reason || ''}${item.url ? ` | ${item.url}` : ''}`;
+}
 
 /** The whole report as plain text: every item, the guard result and the run log. */
-function reportToText(report) {
+function reportToText(tool, report) {
   const lines = [
-    `SNM run ${report.runId}`,
+    `${tool.title} run ${report.runId}`,
     `Started: ${report.startedAt}  Finished: ${report.finishedAt || '?'}`,
     `Kind: ${report.dryRun ? 'dry run' : 'pull request run'}  Guard: ${report.guard?.outcome || '?'}`,
     report.runUrl ? `Log: ${report.runUrl}` : '',
     '',
     'SOURCES',
-    ...Object.entries(report.sources || {}).map(([name, s]) => `  ${name}: ${s.pages} pages, ${s.read} read, ${s.failed} failed`),
+    ...Object.entries(report.sources || {}).map(([name, s]) => `  ${name}: ${s.read} read, ${s.failed} failed${s.note ? ` (${s.note})` : ''}`),
   ];
-  const section = (title, items, render) => {
-    lines.push('', `${title} (${items.length})`);
-    for (const item of items) lines.push(`  - ${render(item)}`);
-  };
-  section('NEW AMIIBO', report.added || [], (a) =>
-    `${a.name} | ${a.amiiboSeries} | ${a.id} | ${a.releaseDate || 'no date'} | image ${a.image} | ${a.url}${a.guessed?.length ? ` | check: ${a.guessed.join('; ')}` : ''}`);
-  section('FILLED', report.filled || [], (f) => `${f.name} | ${f.id} | ${f.field} = ${f.value} | ${f.source}${f.url ? ` | ${f.url}` : ''}`);
-  section('SOURCES DISAGREE (not applied)', report.conflicts || [], (c) => `${c.name} | ${c.id} | ${c.field}: ours ${c.ours}, ${c.source} says ${c.theirs}${c.url ? ` | ${c.url}` : ''}`);
-  section('MATCHED MORE THAN ONE (not applied)', report.ambiguous || [], (u) => `${u.name} | ${u.reason} | ${u.url}`);
-  section('NOT MATCHED (not applied)', report.unmatched || [], (u) => `${u.name}${u.series ? ` | ${u.series}` : ''} | ${u.releaseDate || 'no date'} | ${u.reason} | ${u.url}`);
-  section('ERRORS', report.errors || [], (e) => e);
+  for (const [key, items] of Object.entries(report.sections || {})) {
+    lines.push('', `${(tool.sections[key] || key).toUpperCase()} (${items.length})`);
+    for (const item of items) lines.push(`  - ${itemText(item)}`);
+  }
+  lines.push('', `ERRORS (${(report.errors || []).length})`, ...(report.errors || []).map((e) => `  - ${e}`));
   if (report.guard?.report) lines.push('', 'GUARD', report.guard.report);
   if (report.log?.length) lines.push('', 'RUN LOG', ...report.log);
   return `${lines.join('\n')}\n`;
@@ -666,50 +801,52 @@ async function copyText(text) {
   }
 }
 
-async function exportRuns(index) {
+async function exportRuns(tool, index) {
   const recent = index.slice(0, 10);
   toast(`Collecting ${recent.length} reports…`);
   try {
-    const reports = await Promise.all(recent.map((run) => fileJson(`reports/${run.runId}.json`, REPORTS_BRANCH).catch(() => null)));
-    const text = reports.filter(Boolean).map(reportToText).join(`\n${'='.repeat(72)}\n\n`);
-    download(`snm-runs-${new Date().toISOString().slice(0, 10)}.txt`, text, 'text/plain');
+    const reports = await Promise.all(recent.map((run) => fileJson(`${tool.id}/reports/${run.runId}.json`, REPORTS_BRANCH).catch(() => null)));
+    const text = reports.filter(Boolean).map((report) => reportToText(tool, report)).join(`\n${'='.repeat(72)}\n\n`);
+    download(`${tool.id}-runs-${new Date().toISOString().slice(0, 10)}.txt`, text, 'text/plain');
   } catch (error) {
     toast(`Couldn’t export: ${error.message}`, true);
   }
 }
 
-/** Sources table, new amiibo, fills, disagreements, unmatched, errors. */
-async function reportDetails(report, prBranch) {
+/** Sources table, then each section of the report, errors, guard and log. */
+async function reportDetails(tool, report, prBranch) {
   const wrap = h('div', { class: 'stack' });
   wrap.append(h('div', { class: 'table-wrap' }, h('table', {},
-    h('thead', {}, h('tr', {}, ...['Source', 'Pages', 'Read', 'Failed'].map((t) => h('th', {}, t)))),
+    h('thead', {}, h('tr', {}, ...['Source', 'Read', 'Failed', 'Note'].map((t) => h('th', {}, t)))),
     h('tbody', {}, Object.entries(report.sources || {}).map(([name, s]) =>
-      h('tr', {}, h('td', {}, name), h('td', {}, String(s.pages)), h('td', {}, String(s.read)), h('td', {}, s.failed ? pill(String(s.failed), 'warn') : '0')))))));
+      h('tr', {}, h('td', {}, name), h('td', {}, String(s.read)), h('td', {}, s.failed ? pill(String(s.failed), 'warn') : '0'), h('td', { class: 'small muted' }, s.note || '')))))));
 
-  if (report.added.length) {
-    wrap.append(h('h3', {}, `New amiibo (${report.added.length})`));
-    const list = h('ul', { class: 'list' });
-    for (const item of report.added) {
-      const img = prBranch
-        ? await repoImage(`images/amiibo/${item.id}.webp`, prBranch, item.name)
-        : h('span', {});
-      list.append(h('li', { class: 'row' }, img,
-        h('div', {},
-          h('strong', {}, item.name), ` (${item.amiiboSeries}) `, h('code', {}, item.id),
-          h('div', { class: 'small muted' }, `${item.releaseDate || 'no date'} · image ${item.image} · `, link('page', item.url)),
-          item.guessed.length ? h('div', { class: 'small warn' }, `Check: ${item.guessed.join('; ')}`) : null)));
+  const sections = report.sections || {};
+  const order = [...Object.keys(tool.sections), ...Object.keys(sections).filter((key) => !(key in tool.sections))];
+  for (const key of order) {
+    const items = sections[key] || [];
+    if (!items.length) continue;
+    const title = `${tool.sections[key] || key} (${items.length})`;
+    if (key === 'added') {
+      wrap.append(h('h3', {}, title));
+      const list = h('ul', { class: 'list' });
+      for (const item of items) {
+        const img = prBranch
+          ? await repoImage(item.image === 'placeholder' ? PLACEHOLDER_IMAGE : item.id.startsWith('ob-') ? `images/amiibo/${item.id}.webp` : `images/amiibo/${item.id.slice(0, 8)}-${item.id.slice(8)}.webp`, prBranch, item.name)
+          : h('span', {});
+        list.append(h('li', { class: 'row' }, img,
+          h('div', {},
+            h('strong', {}, item.name), ` (${item.amiiboSeries}) `, h('code', {}, item.id),
+            h('div', { class: 'small muted' }, `${item.releaseDate || 'no date'} · ${item.image === 'placeholder' ? 'placeholder picture' : 'picture'}${item.sources ? ` · from ${item.sources.join(', ')}` : ''} `, item.url ? link('page', item.url) : null),
+            item.guessed?.length ? h('div', { class: 'small warn' }, `Check: ${item.guessed.join('; ')}`) : null)));
+      }
+      wrap.append(list);
+    } else {
+      wrap.append(h('h3', {}, title), h('ul', { class: 'list small' }, items.slice(0, 400).map((item) =>
+        h('li', {}, itemText(item).replace(/ \| https:\S+$/, ''), item.url ? [' ', link('page', item.url)] : null))));
     }
-    wrap.append(list);
   }
-  const simpleList = (title, items, render) => {
-    if (!items.length) return;
-    wrap.append(h('h3', {}, `${title} (${items.length})`), h('ul', { class: 'list small' }, items.slice(0, 300).map((item) => h('li', {}, render(item)))));
-  };
-  simpleList('Filled empty fields', report.filled, (f) => [`${f.name} `, h('code', {}, f.id), ` ${f.field} = ${f.value} (${f.source})`]);
-  simpleList('Sources disagree (not applied)', report.conflicts, (c) => [`${c.name} `, h('code', {}, c.id), ` ${c.field}: ours ${c.ours}, ${c.source} says ${c.theirs} `, c.url ? link('page', c.url) : null]);
-  simpleList('Matched more than one (not applied)', report.ambiguous, (u) => [`${u.name}: ${u.reason} `, link('page', u.url)]);
-  simpleList('Not matched (not applied)', report.unmatched, (u) => [`${u.name}${u.series ? ` (${u.series})` : ''}: ${u.reason} `, link('page', u.url)]);
-  simpleList('Errors', report.errors, (e) => h('span', { class: 'error' }, e));
+  if (report.errors?.length) wrap.append(h('h3', {}, `Errors (${report.errors.length})`), h('ul', { class: 'list small' }, report.errors.map((e) => h('li', { class: 'error' }, e))));
   if (report.guard?.report) wrap.append(h('h3', {}, 'Guard'), h('pre', {}, report.guard.report));
   if (report.log?.length && !prBranch) wrap.append(h('h3', {}, 'Run log'), h('pre', {}, report.log.join('\n')));
   return wrap;
@@ -822,7 +959,7 @@ function showNewEntry() {
         field('amiiboSeries', 'amiibo series', { list: 'series-list' }),
         field('gameSeries', 'Game series', { list: 'game-list' }),
         h('label', {}, 'Type', type),
-        field('imageFallback', 'Image URL (https, e.g. from Nintendo’s page)'),
+        field('imageFallback', 'Image URL (optional, https; otherwise the placeholder until Update Database finds one)'),
         ...REGIONS.map((r) => field(`release.${r}`, `Release ${r.toUpperCase()} (YYYY-MM-DD)`))),
       h('button', { type: 'button', onclick: () => addEntry(inputs, type.value) }, 'Propose this amiibo')),
   );
@@ -832,7 +969,7 @@ async function addEntry(inputs, type) {
   const value = (key) => inputs[key].value.trim();
   const problems = [];
   for (const key of ['name', 'character', 'amiiboSeries', 'gameSeries']) if (!value(key)) problems.push(`${key} is required.`);
-  if (!/^https:\/\/\S+$/.test(value('imageFallback'))) problems.push('Image URL must start with https://.');
+  if (value('imageFallback') && !/^https:\/\/\S+$/.test(value('imageFallback'))) problems.push('Image URL must start with https://.');
   const release = {};
   for (const r of REGIONS) {
     const date = value(`release.${r}`);
@@ -857,15 +994,18 @@ async function addEntry(inputs, type) {
       copy.amiibo.push({
         id, head: '', tail: '', name,
         character: value('character'), gameSeries: value('gameSeries'), amiiboSeries: value('amiiboSeries'), type,
-        image: `images/amiibo/${id}.webp`, imageFallback: value('imageFallback'), release, source: 'oddbolt',
+        image: PLACEHOLDER_IMAGE, imageFallback: value('imageFallback') || null, release, source: 'oddbolt',
       });
       copy.amiibo.sort((a, b) => a.id.localeCompare(b.id));
     });
     const pr = await proposeChange({
       branch: `admin/add-${id}-${stamp()}`,
       title: `Add ${name}`,
-      body: `Added in the dashboard by @${state.user.login} as \`${id}\`. The image is downloaded and converted the next time the weekly update runs.`,
-      files: [{ path: 'data/catalogue.json', text: catalogueText(catalogue) }],
+      body: `Added in the dashboard by @${state.user.login} as \`${id}\`. It shows the placeholder picture until Update Database downloads ${value('imageFallback') ? 'the image URL given' : 'one from AmiiboAPI or amiibo life'}.`,
+      files: [
+        { path: 'data/catalogue.json', text: catalogueText(catalogue) },
+        await manualProvenanceFile(id, ['name', 'character', 'gameSeries', 'amiiboSeries', 'type', ...REGIONS.filter((r) => release[r]).map((r) => `release.${r}`)]),
+      ],
     });
     toast(`Opened #${pr.number}. Merge it in Review.`);
     showTab('review');
@@ -933,8 +1073,11 @@ async function saveEntry(entry, inputs) {
     const pr = await proposeChange({
       branch: `admin/edit-${entry.id}-${stamp()}`,
       title: `Edit ${entry.name}`,
-      body: `Edited in the dashboard by @${state.user.login}.\n\n${diff.map((line) => `- ${line}`).join('\n')}`,
-      files: [{ path: 'data/catalogue.json', text: catalogueText(catalogue) }],
+      body: `Edited in the dashboard by @${state.user.login}.\n\n${diff.map((line) => `- ${line}`).join('\n')}\n\nThese fields are marked as yours, so the tools won't change them.`,
+      files: [
+        { path: 'data/catalogue.json', text: catalogueText(catalogue) },
+        await manualProvenanceFile(entry.id, diff.map((line) => line.split(':')[0])),
+      ],
       labels,
     });
     toast(`Opened #${pr.number}. Merge it in Review.`);
@@ -967,7 +1110,7 @@ async function promoteEntry(entry) {
       branch: `admin/promote-${entry.id}-${stamp()}`,
       title: `Real id for ${entry.name}`,
       body: `Set in the dashboard by @${state.user.login}: \`${entry.id}\` → \`${realId}\` (kept as an alias).`,
-      files: [{ path: 'data/catalogue.json', text: catalogueText(catalogue) }],
+      files: [{ path: 'data/catalogue.json', text: catalogueText(catalogue) }, await manualProvenanceFile(realId, ['id'], entry.id)],
     });
     toast(`Opened #${pr.number}. Merge it in Review.`);
     showTab('review');
@@ -1081,7 +1224,7 @@ function start() {
   $('#signin-button').addEventListener('click', submit);
   $('#token').addEventListener('keydown', (event) => event.key === 'Enter' && submit());
   window.addEventListener('hashchange', () => {
-    if (state.token && location.hash.slice(1) !== currentHash) showTab(location.hash.slice(1) || 'overview');
+    if (state.token && location.hash.slice(1) !== currentHash) showTab(location.hash.slice(1) || 'home');
   });
 
   const saved = getStored('admin.token');

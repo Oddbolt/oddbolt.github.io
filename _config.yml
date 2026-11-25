@@ -157,6 +157,7 @@ pwa:
     deny_paths:
       # - "/example"  # URLs match `<SITE_URL>/example/*` will not be cached by the PWA
       - "/admin"
+      - "/amiibo-companion/admin"
       - "/amiibo-cdn"
 
 paginate: 10

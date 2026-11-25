@@ -138,3 +138,12 @@ dialog::backdrop { background: rgba(0, 0, 0, .5); }
 .app-row span:first-child { color: #a3a9b6; }
 .app-row span:last-child { text-align: right; }
 .app-note, .app-removed { color: #a3a9b6; font-size: 12px; margin-top: 12px; }
+
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand img { border-radius: 8px; }
+.brand-sub { font-size: 12px; color: var(--muted); }
+.tool-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); margin-bottom: 12px; }
+.tool { display: flex; flex-direction: column; gap: 6px; margin-bottom: 0; }
+.tool p { margin: 0; }
+.tool .row:last-child { margin-top: auto; padding-top: 6px; }
+.tool.planned { opacity: .7; border-style: dashed; }
