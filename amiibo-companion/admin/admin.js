@@ -121,9 +121,6 @@ function storage(kind) {
     return null;
   }
 }
-function getStored(key) {
-  return storage('session')?.getItem(key) || storage('local')?.getItem(key) || '';
-}
 
 function pill(text, kind) {
   return h('span', { class: `pill ${kind || ''}` }, text);
@@ -345,7 +342,50 @@ async function dispatch(workflow, inputs = {}) {
 
 // ─── Sign in ────────────────────────────────────────────────────────
 
-async function signIn(token, repo, remember) {
+// The token lives in memory only. "Remember" saves it encrypted (AES-GCM, key from your
+// passphrase via PBKDF2), so other pages on this site, which share its storage, can't use it.
+const VAULT_KEY = 'admin.vault';
+const IDLE_LOCK_MS = 30 * 60 * 1000;
+
+const b64 = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+const unb64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+
+async function vaultKey(passphrase, salt) {
+  const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 600000, hash: 'SHA-256' },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+async function saveVault(token, passphrase) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await vaultKey(passphrase, salt);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(token));
+  storage('local')?.setItem(VAULT_KEY, JSON.stringify({ v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) }));
+}
+
+async function openVault(passphrase) {
+  const vault = JSON.parse(storage('local')?.getItem(VAULT_KEY) || 'null');
+  if (!vault) throw new Error('Nothing saved on this device.');
+  const key = await vaultKey(passphrase, unb64(vault.salt));
+  try {
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(vault.iv) }, key, unb64(vault.ct));
+    return new TextDecoder().decode(plain);
+  } catch {
+    throw new Error('Wrong passphrase.');
+  }
+}
+
+function forgetVault() {
+  storage('local')?.removeItem(VAULT_KEY);
+}
+
+async function signIn(token, repo) {
   state.token = token;
   state.repo = repo;
   const [user, info] = await Promise.all([gh('/user'), gh(repoPath())]);
@@ -353,17 +393,30 @@ async function signIn(token, repo, remember) {
   if (!info.permissions?.push) throw new Error('This token cannot write to the repository.');
   state.user = user;
   storage('local')?.setItem('admin.repo', repo);
-  const store = storage(remember ? 'local' : 'session');
-  store?.setItem('admin.token', token);
   $('#signin').hidden = true;
+  $('#unlock').hidden = true;
   $('#tabs').hidden = false;
   $('#signout').hidden = false;
+  startIdleLock();
   showTab(location.hash.slice(1) || 'home');
 }
 
+/** Forgets the token in memory after 30 minutes without use; the saved, encrypted copy stays. */
+function startIdleLock() {
+  let timer;
+  const reset = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      state.token = '';
+      location.reload();
+    }, IDLE_LOCK_MS);
+  };
+  for (const event of ['pointerdown', 'keydown', 'scroll']) window.addEventListener(event, reset, { passive: true });
+  reset();
+}
+
 function signOut() {
-  storage('local')?.removeItem('admin.token');
-  storage('session')?.removeItem('admin.token');
+  forgetVault();
   state.token = '';
   state.catalogue = null;
   location.hash = '';
@@ -1202,20 +1255,35 @@ async function rollBack(commit, undone) {
 // ─── Start ──────────────────────────────────────────────────────────
 
 function start() {
+  // Refuse to run inside another site's frame (it could trick clicks such as Merge).
+  if (window.top !== window.self) {
+    $('#framed').hidden = false;
+    return;
+  }
+  // Older versions saved the token in plain text; remove it.
+  for (const kind of ['local', 'session']) storage(kind)?.removeItem('admin.token');
+
   $('#repo').value = storage('local')?.getItem('admin.repo') || '';
   for (const button of document.querySelectorAll('#tabs button')) {
     button.addEventListener('click', () => showTab(button.dataset.tab));
   }
   $('#signout').addEventListener('click', signOut);
+  $('#remember').addEventListener('change', () => ($('#new-passphrase-row').hidden = !$('#remember').checked));
+
   const submit = async () => {
     const token = $('#token').value.trim();
     const repo = $('#repo').value.trim();
+    const remember = $('#remember').checked;
+    const passphrase = $('#new-passphrase').value;
     $('#signin-error').textContent = '';
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return ($('#signin-error').textContent = 'Enter the repository as owner/name.');
     if (!token) return ($('#signin-error').textContent = 'Enter a token.');
+    if (remember && passphrase.length < 8) return ($('#signin-error').textContent = 'Choose a passphrase of at least 8 characters.');
     try {
-      await signIn(token, repo, $('#remember').checked);
+      await signIn(token, repo);
+      if (remember) await saveVault(token, passphrase);
       $('#token').value = '';
+      $('#new-passphrase').value = '';
     } catch (error) {
       state.token = '';
       $('#signin-error').textContent = error.status === 401 ? 'GitHub rejected the token.' : error.status === 404 ? 'Repository not found, or the token can’t see it.' : String(error.message || error);
@@ -1223,20 +1291,35 @@ function start() {
   };
   $('#signin-button').addEventListener('click', submit);
   $('#token').addEventListener('keydown', (event) => event.key === 'Enter' && submit());
+
+  const unlock = async () => {
+    $('#unlock-error').textContent = '';
+    $('#unlock-button').disabled = true;
+    try {
+      const token = await openVault($('#passphrase').value);
+      $('#passphrase').value = '';
+      await signIn(token, storage('local')?.getItem('admin.repo') || '');
+    } catch (error) {
+      state.token = '';
+      $('#unlock-error').textContent = error.status === 401 ? 'GitHub rejected the saved token (expired?). Use a different token.' : String(error.message || error);
+    } finally {
+      $('#unlock-button').disabled = false;
+    }
+  };
+  $('#unlock-button').addEventListener('click', unlock);
+  $('#passphrase').addEventListener('keydown', (event) => event.key === 'Enter' && unlock());
+  $('#forget-button').addEventListener('click', () => {
+    forgetVault();
+    $('#unlock').hidden = true;
+    $('#signin').hidden = false;
+  });
+
   window.addEventListener('hashchange', () => {
     if (state.token && location.hash.slice(1) !== currentHash) showTab(location.hash.slice(1) || 'home');
   });
 
-  const saved = getStored('admin.token');
-  const repo = storage('local')?.getItem('admin.repo');
-  if (saved && repo) {
-    signIn(saved, repo, Boolean(storage('local')?.getItem('admin.token'))).catch(() => {
-      storage('local')?.removeItem('admin.token');
-      storage('session')?.removeItem('admin.token');
-      $('#signin').hidden = false;
-    });
-    $('#signin').hidden = true;
-  }
+  const hasVault = Boolean(storage('local')?.getItem(VAULT_KEY)) && Boolean(storage('local')?.getItem('admin.repo'));
+  $(hasVault ? '#unlock' : '#signin').hidden = false;
+  if (hasVault) $('#passphrase').focus();
 }
-
 start();

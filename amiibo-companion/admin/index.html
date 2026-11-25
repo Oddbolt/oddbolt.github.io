@@ -34,14 +34,30 @@ sitemap: false
 </header>
 
 <main id="app">
-  <section id="signin" class="card narrow">
+  <section id="signin" class="card narrow" hidden>
     <h2>Sign in</h2>
     <p class="muted">Use a GitHub fine-grained personal access token limited to the data repository. Nothing is sent anywhere except GitHub.</p>
     <label>Data repository <input id="repo" autocomplete="off" spellcheck="false" placeholder="owner/name"></label>
     <label>Token <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
-    <label class="check"><input id="remember" type="checkbox"> Remember on this device</label>
+    <label class="check"><input id="remember" type="checkbox"> Remember on this device (encrypted)</label>
+    <label id="new-passphrase-row" hidden>Passphrase to unlock it next time (8+ characters)
+      <input id="new-passphrase" type="password" autocomplete="new-password" spellcheck="false"></label>
     <button type="button" id="signin-button">Sign in</button>
     <p id="signin-error" class="error" role="alert"></p>
+  </section>
+  <section id="unlock" class="card narrow" hidden>
+    <h2>Unlock</h2>
+    <p class="muted">Your token is saved on this device, encrypted. Enter your passphrase.</p>
+    <label>Passphrase <input id="passphrase" type="password" autocomplete="current-password" spellcheck="false"></label>
+    <div class="row">
+      <button type="button" id="unlock-button">Unlock</button>
+      <button type="button" id="forget-button" class="ghost">Use a different token</button>
+    </div>
+    <p id="unlock-error" class="error" role="alert"></p>
+  </section>
+  <section id="framed" class="card narrow" hidden>
+    <h2>Open this page directly</h2>
+    <p class="muted">For your safety, Remote Admin doesn’t work inside another site.</p>
   </section>
   <div id="view"></div>
 </main>
