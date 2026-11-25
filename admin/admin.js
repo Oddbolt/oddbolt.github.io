@@ -486,7 +486,8 @@ async function showRuns(runId) {
       h('div', {}, h('h2', {}, 'SNM runs'), h('p', { class: 'muted small' }, 'Every run saves a report, including dry runs.')),
       h('div', { class: 'row' },
         h('button', { type: 'button', onclick: () => runSnm(true) }, 'Dry run now'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => runSnm(false) }, 'Run and open PR'))),
+        h('button', { type: 'button', class: 'ghost', onclick: () => runSnm(false) }, 'Run and open PR'),
+        index.length ? h('button', { type: 'button', class: 'ghost', onclick: () => exportRuns(index) }, 'Export recent runs') : null)),
     h('div', { class: 'card table-wrap' },
       index.length === 0
         ? h('p', { class: 'muted' }, 'No runs yet.')
@@ -504,10 +505,73 @@ async function showRun(runId) {
         h('h2', {}, `SNM run ${when(report.startedAt)}`),
         h('div', { class: 'row' },
           h('button', { type: 'button', class: 'ghost', onclick: () => showTab('runs') }, 'All runs'),
-          report.runUrl ? link('Log', report.runUrl) : null)),
+          report.runUrl ? link('Log on GitHub', report.runUrl) : null)),
+      h('div', { class: 'row' },
+        h('button', { type: 'button', onclick: () => copyText(reportToText(report)) }, 'Copy as text'),
+        h('button', { type: 'button', class: 'ghost', onclick: () => download(`snm-run-${report.runId}.txt`, reportToText(report), 'text/plain') }, 'Download .txt'),
+        h('button', { type: 'button', class: 'ghost', onclick: () => download(`snm-run-${report.runId}.json`, JSON.stringify(report, null, 2), 'application/json') }, 'Download .json')),
       h('p', { class: 'muted small' }, `${report.dryRun ? 'Dry run' : 'Pull request run'} · guard ${report.guard?.outcome || '?'}`),
       await reportDetails(report, null)),
   );
+}
+
+// ─── Export ─────────────────────────────────────────────────────────
+
+/** The whole report as plain text: every item, the guard result and the run log. */
+function reportToText(report) {
+  const lines = [
+    `SNM run ${report.runId}`,
+    `Started: ${report.startedAt}  Finished: ${report.finishedAt || '?'}`,
+    `Kind: ${report.dryRun ? 'dry run' : 'pull request run'}  Guard: ${report.guard?.outcome || '?'}`,
+    report.runUrl ? `Log: ${report.runUrl}` : '',
+    '',
+    'SOURCES',
+    ...Object.entries(report.sources || {}).map(([name, s]) => `  ${name}: ${s.pages} pages, ${s.read} read, ${s.failed} failed`),
+  ];
+  const section = (title, items, render) => {
+    lines.push('', `${title} (${items.length})`);
+    for (const item of items) lines.push(`  - ${render(item)}`);
+  };
+  section('NEW AMIIBO', report.added || [], (a) =>
+    `${a.name} | ${a.amiiboSeries} | ${a.id} | ${a.releaseDate || 'no date'} | image ${a.image} | ${a.url}${a.guessed?.length ? ` | check: ${a.guessed.join('; ')}` : ''}`);
+  section('FILLED', report.filled || [], (f) => `${f.name} | ${f.id} | ${f.field} = ${f.value} | ${f.source}${f.url ? ` | ${f.url}` : ''}`);
+  section('SOURCES DISAGREE (not applied)', report.conflicts || [], (c) => `${c.name} | ${c.id} | ${c.field}: ours ${c.ours}, ${c.source} says ${c.theirs}${c.url ? ` | ${c.url}` : ''}`);
+  section('MATCHED MORE THAN ONE (not applied)', report.ambiguous || [], (u) => `${u.name} | ${u.reason} | ${u.url}`);
+  section('NOT MATCHED (not applied)', report.unmatched || [], (u) => `${u.name}${u.series ? ` | ${u.series}` : ''} | ${u.releaseDate || 'no date'} | ${u.reason} | ${u.url}`);
+  section('ERRORS', report.errors || [], (e) => e);
+  if (report.guard?.report) lines.push('', 'GUARD', report.guard.report);
+  if (report.log?.length) lines.push('', 'RUN LOG', ...report.log);
+  return `${lines.join('\n')}\n`;
+}
+
+function download(filename, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type: `${type};charset=utf-8` }));
+  const a = h('a', { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Copied. Paste it into the chat.');
+  } catch {
+    toast('Couldn’t copy here. Use Download .txt instead.', true);
+  }
+}
+
+async function exportRuns(index) {
+  const recent = index.slice(0, 10);
+  toast(`Collecting ${recent.length} reports…`);
+  try {
+    const reports = await Promise.all(recent.map((run) => fileJson(`reports/${run.runId}.json`, REPORTS_BRANCH).catch(() => null)));
+    const text = reports.filter(Boolean).map(reportToText).join(`\n${'='.repeat(72)}\n\n`);
+    download(`snm-runs-${new Date().toISOString().slice(0, 10)}.txt`, text, 'text/plain');
+  } catch (error) {
+    toast(`Couldn’t export: ${error.message}`, true);
+  }
 }
 
 /** Sources table, new amiibo, fills, disagreements, unmatched, errors. */
@@ -543,6 +607,7 @@ async function reportDetails(report, prBranch) {
   simpleList('Not matched (not applied)', report.unmatched, (u) => [`${u.name}${u.series ? ` (${u.series})` : ''}: ${u.reason} `, link('page', u.url)]);
   simpleList('Errors', report.errors, (e) => h('span', { class: 'error' }, e));
   if (report.guard?.report) wrap.append(h('h3', {}, 'Guard'), h('pre', {}, report.guard.report));
+  if (report.log?.length && !prBranch) wrap.append(h('h3', {}, 'Run log'), h('pre', {}, report.log.join('\n')));
   return wrap;
 }
 
