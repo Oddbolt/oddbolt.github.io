@@ -616,6 +616,7 @@ async function reportDetails(report, prBranch) {
 async function showCatalogue(id) {
   loading('Loading the catalogue…');
   const catalogue = await loadCatalogue();
+  if (id === 'new') return showNewEntry();
   if (id) return showEntry(decodeURIComponent(id));
   const search = h('input', { type: 'search', placeholder: 'Search name, id, series…', autocomplete: 'off' });
   const filter = h('select', {},
@@ -649,7 +650,9 @@ async function showCatalogue(id) {
     h('div', { class: 'card' },
       h('div', { class: 'row' }, h('div', { class: 'grow' }, search), h('div', {}, filter)),
       h('div', { class: 'row spread' }, count,
-        h('button', { type: 'button', class: 'ghost', onclick: async () => { state.catalogue = null; showTab('catalogue'); } }, 'Reload'))),
+        h('div', { class: 'row' },
+          h('button', { type: 'button', onclick: () => showTab('catalogue/new', 'new') }, 'Add amiibo'),
+          h('button', { type: 'button', class: 'ghost', onclick: async () => { state.catalogue = null; showTab('catalogue'); } }, 'Reload')))),
     h('div', { class: 'card table-wrap' }, h('table', {}, h('tbody', {}, body))),
   );
   render();
@@ -691,6 +694,80 @@ function showEntry(id) {
         h('button', { type: 'button', class: 'danger', onclick: () => removeEntry(entry) }, 'Propose removal')),
       h('p', { class: 'small muted' }, 'Changes are opened as a pull request. They go live only after you merge them in Review.')),
   );
+}
+
+/** Form for an amiibo SNM couldn't add (no series on the page, not on Nintendo's sites…). */
+function showNewEntry() {
+  const catalogue = state.catalogue;
+  const list = (id, values) => h('datalist', { id }, [...new Set(values)].sort().map((value) => h('option', { value })));
+  const inputs = {};
+  const field = (key, label, attrs = {}) => {
+    inputs[key] = h('input', { autocomplete: 'off', spellcheck: 'false', ...attrs });
+    return h('label', {}, label, inputs[key]);
+  };
+  const type = h('select', {}, ...['Figure', 'Card', 'Band', 'Yarn', 'Block'].map((value) => h('option', { value }, value)));
+  view(
+    h('div', { class: 'card' },
+      h('div', { class: 'row spread' }, h('h2', {}, 'Add amiibo'), h('button', { type: 'button', class: 'ghost', onclick: () => showTab('catalogue') }, 'Back')),
+      h('p', { class: 'small muted' }, 'It gets a temporary id (ob-year-number) until its real NFC id is known. Opened as a pull request.'),
+      list('series-list', catalogue.amiibo.map((entry) => entry.amiiboSeries)),
+      list('game-list', catalogue.amiibo.map((entry) => entry.gameSeries)),
+      h('div', { class: 'fields' },
+        field('name', 'Name'),
+        field('character', 'Character'),
+        field('amiiboSeries', 'amiibo series', { list: 'series-list' }),
+        field('gameSeries', 'Game series', { list: 'game-list' }),
+        h('label', {}, 'Type', type),
+        field('imageFallback', 'Image URL (https, e.g. from Nintendo’s page)'),
+        ...REGIONS.map((r) => field(`release.${r}`, `Release ${r.toUpperCase()} (YYYY-MM-DD)`))),
+      h('button', { type: 'button', onclick: () => addEntry(inputs, type.value) }, 'Propose this amiibo')),
+  );
+}
+
+async function addEntry(inputs, type) {
+  const value = (key) => inputs[key].value.trim();
+  const problems = [];
+  for (const key of ['name', 'character', 'amiiboSeries', 'gameSeries']) if (!value(key)) problems.push(`${key} is required.`);
+  if (!/^https:\/\/\S+$/.test(value('imageFallback'))) problems.push('Image URL must start with https://.');
+  const release = {};
+  for (const r of REGIONS) {
+    const date = value(`release.${r}`);
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) problems.push(`Release ${r.toUpperCase()} must be YYYY-MM-DD.`);
+    release[r] = date || null;
+  }
+  if (problems.length) return toast(problems.join(' '), true);
+  const name = value('name');
+  if (state.catalogue.amiibo.some((entry) => entry.name.toLowerCase() === name.toLowerCase() && entry.amiiboSeries.toLowerCase() === value('amiiboSeries').toLowerCase())) {
+    return toast(`${name} (${value('amiiboSeries')}) is already in the catalogue.`, true);
+  }
+  const year = (Object.values(release).filter(Boolean).sort()[0] || new Date().toISOString()).slice(0, 4);
+  if (!(await confirmDialog(`Add ${name}?`, [`${value('amiiboSeries')} · ${type} · ${REGIONS.map((r) => `${r.toUpperCase()} ${release[r] || '—'}`).join(' ')}`], 'Open pull request'))) return;
+  try {
+    let id = '';
+    const catalogue = await freshCatalogueWith((copy) => {
+      const taken = new Set(copy.amiibo.flatMap((entry) => [entry.id, ...(entry.aliases || [])]));
+      for (let n = 1; !id; n++) {
+        const candidate = `ob-${year}-${String(n).padStart(4, '0')}`;
+        if (!taken.has(candidate)) id = candidate;
+      }
+      copy.amiibo.push({
+        id, head: '', tail: '', name,
+        character: value('character'), gameSeries: value('gameSeries'), amiiboSeries: value('amiiboSeries'), type,
+        image: `images/amiibo/${id}.webp`, imageFallback: value('imageFallback'), release, source: 'oddbolt',
+      });
+      copy.amiibo.sort((a, b) => a.id.localeCompare(b.id));
+    });
+    const pr = await proposeChange({
+      branch: `admin/add-${id}-${stamp()}`,
+      title: `Add ${name}`,
+      body: `Added in the dashboard by @${state.user.login} as \`${id}\`. The image is downloaded and converted the next time the weekly update runs.`,
+      files: [{ path: 'data/catalogue.json', text: catalogueText(catalogue) }],
+    });
+    toast(`Opened #${pr.number}. Merge it in Review.`);
+    showTab('review');
+  } catch (error) {
+    toast(`Couldn’t open the pull request: ${error.message}`, true);
+  }
 }
 
 function readEdits(entry, inputs) {
