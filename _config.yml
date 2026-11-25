@@ -156,6 +156,8 @@ pwa:
     # shares the same domain name as the current website.
     deny_paths:
       # - "/example"  # URLs match `<SITE_URL>/example/*` will not be cached by the PWA
+      - "/admin"
+      - "/amiibo-cdn"
 
 paginate: 10
 
