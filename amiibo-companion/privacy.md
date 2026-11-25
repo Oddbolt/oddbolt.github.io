@@ -1,55 +1,74 @@
 ---
-layout: default
-title: Amiibo Companion Privacy Policy
-description: What information the Amiibo Companion app handles.
+layout: page
+title: Privacy Policy
+description: How the Amiibo Companion app handles your information.
+permalink: /amiibo-companion/privacy.html
 ---
 
-# Amiibo Companion Privacy Policy
+**Amiibo Companion** (Android) · Developer: **Oddbolt** · Effective **November 24, 2026**
 
-*Effective November 24, 2026*
+## Summary
 
-This policy explains what information the Amiibo Companion Android app ("the app"), made by Oddbolt ("we"), handles. In short: there is no account, your collection stays on your phone, and we don't collect or sell your personal information. The app shows ads provided by Google AdMob, which collects some device information as described below.
+- **No account.** You never sign up or sign in.
+- **Your collection stays on your phone.** We never receive it.
+- **We don't collect, sell, or share your personal information.**
+- **Ads are provided by Google AdMob**, which collects some device information to show ads.
 
-## Information stored on your device
+## 1. Information stored on your device
 
-The app stores what you enter on your phone only: the amiibo you own and any details you add (such as packaging, condition, purchase date, price paid, and notes), your wishlist, photos you attach, and your settings. This information is not sent to us. It is deleted when you uninstall the app or clear its data. If Android backup is turned on for your device, Android may include this app data in your Google account backup, which is governed by Google's privacy policy.
+The app saves what you enter only on your phone: the amiibo you own, any details you add (such as packaging, condition, purchase date, price paid, notes, and copy names), your wishlist, photos you attach, and your settings. This information is not sent to us or anyone else.
 
-## Camera and photos
+If Android backup is on, Android may include this data in your Google account backup, under [Google's Privacy Policy](https://policies.google.com/privacy).
 
-The app asks for camera access only when you choose to take a photo of a copy, and opens the system photo picker only when you choose existing photos. Photos are copied into the app's private storage on your phone and are never uploaded by the app.
+## 2. Permissions
 
-## Backups you export
+| Permission | When it's used | What happens to the data |
+| --- | --- | --- |
+| Camera | Only when you choose to take a photo of a copy | Saved in the app's private storage on your phone. Never uploaded. |
+| Photos | Only when you choose existing photos (system photo picker) | Copied into the app's private storage on your phone. Never uploaded. |
 
-When you export a backup, the app creates a file containing your collection, wishlist, settings, and photos, and opens your phone's share sheet. Where that file goes (for example Google Drive or your Files app) is your choice, and that service's privacy policy applies.
+## 3. Backups you export
 
-## Data the app downloads
+Exporting a backup creates a file with your collection, wishlist, settings, and photos, and opens your phone's share sheet. You choose where it goes, such as Google Drive or Files, and that service's privacy policy applies.
 
-The app downloads the amiibo catalogue, store links, and amiibo images from our website, oddbolt.github.io, which is hosted by GitHub. If our website can't be reached, it downloads the same files from the jsDelivr content network (cdn.jsdelivr.net), and as a last resort loads amiibo images from GitHub (raw.githubusercontent.com). Like any web request, these include your IP address and basic technical information, which these services may log under the [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) and the [jsDelivr Privacy Policy](https://www.jsdelivr.com/privacy-policy-jsdelivr-net). We do not receive or store this information.
+## 4. Third-party services
 
-## Advertising
+| Service | Why the app uses it | Information involved |
+| --- | --- | --- |
+| [Google AdMob](https://policies.google.com/technologies/partner-sites) | Shows and measures ads | Advertising ID, IP address, approximate location, device and app interaction data |
+| [GitHub](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) (oddbolt.github.io, and raw.githubusercontent.com for images as a last resort) | Downloads the amiibo catalogue, store links, and images | IP address and basic request details, as with any website |
+| [jsDelivr](https://www.jsdelivr.com/privacy-policy-jsdelivr-net) | Backup download source if GitHub Pages is unavailable | IP address and basic request details |
+| Retailers (Best Buy, Walmart, Amazon) | Only when you tap a store link, which opens the retailer's website or app | Handled under that retailer's privacy policy |
 
-The app shows ads served by Google AdMob. To show and measure ads, Google may collect and use information such as your device's advertising ID, IP address, and app interaction data. Ads may be personalized depending on your settings. You can reset or delete your advertising ID in your Android settings under Privacy > Ads. Learn more in [How Google uses information from sites or apps that use its services](https://policies.google.com/technologies/partner-sites).
+We don't receive or store the information these services collect.
 
-## Store links
+## 5. Advertising
 
-Some screens include links to retailers such as Best Buy, Walmart, and Amazon. Opening one takes you to that retailer's website or app, where its own privacy policy applies. Some links are affiliate links, which let the retailer know a purchase came from the app so we may earn a commission. The retailer handles that tracking; the app does not send your personal information to them.
+Ads may be personalized depending on your Google settings. You can reset or delete your advertising ID at any time in your device settings (on most devices: **Settings > Privacy > Ads**).
 
-## Children
+Some store links may be affiliate links. If you buy something after tapping one, the retailer may pay us a commission. The retailer handles that tracking; the app doesn't send them your personal information.
 
-The app is not directed to children under 13, and we do not knowingly collect personal information from children.
+## 6. Children
 
-## Deleting your data
+The app is not directed to children under 13, and we don't knowingly collect personal information from children.
 
-Because your data is stored only on your device, you can delete it at any time by uninstalling the app or clearing its storage in Android settings. We hold no copy of it.
+## 7. Keeping and deleting your data
 
-## Changes to this policy
+Your data stays on your phone until you delete it. Uninstalling the app, or clearing its storage in Android settings, deletes everything. We hold no copy.
 
-If this policy changes, we will update this page and the effective date above.
+## 8. Security
 
-## Contact
+Your data is kept in the app's private storage, which other apps can't access. All downloads use encrypted HTTPS connections.
 
-Questions about this policy: [oddbolt.dev@gmail.com](mailto:oddbolt.dev@gmail.com)
+## 9. Changes to this policy
+
+If this policy changes, we'll update this page and the effective date above.
+
+## 10. Contact
+
+Questions about this policy: [oddbolt.dev@gmail.com](mailto:oddbolt.dev@gmail.com?subject=Privacy%20Policy)
 
 ---
 
-*Amiibo Companion is not affiliated with, endorsed by, or sponsored by Nintendo. amiibo is a trademark of Nintendo.*
+Amiibo Companion is not affiliated with, endorsed by, or sponsored by Nintendo. amiibo is a trademark of Nintendo.
+{: .small }
