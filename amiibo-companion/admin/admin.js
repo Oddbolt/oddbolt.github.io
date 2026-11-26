@@ -42,7 +42,7 @@ const TOOLS = [
     branch: 'db-update/update',
     schedule: 'Runs when you start it',
     options: [],
-    sections: { changes: 'Changes', disagreements: 'One source disagrees (not changed)', kept: 'Your edits kept' },
+    sections: { changes: 'Changes', disagreements: 'One source disagrees (not changed)', kept: 'Your edits kept', notMatched: 'Same name, different series (not used)' },
     summary: (counts) => `${counts.changes ?? 0} changes`,
   },
   {
