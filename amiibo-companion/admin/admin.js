@@ -854,7 +854,7 @@ async function reviewCard(pr) {
       onChange: update,
       onEdit: (item, fields) => (card.dataset.dirty
         ? toast('Tick everything again (or Drop the unticked ones) before editing.', true)
-        : editInPr({ pr, tool, data, item, fields })),
+        : editInPr({ pr, tool, data, item, fields, card })),
     });
     const counts = ['added', 'promoted', 'changed', 'removed'].map((kind) => [kind, data.items.filter((item) => item.kind === kind).length]).filter(([, n]) => n);
     const words = { added: 'new', promoted: 'real ids', changed: 'changed', removed: 'removed' };
@@ -916,7 +916,7 @@ async function reviewCard(pr) {
         const fresh = await gh(repoPath(`/pulls/${pr.number}`));
         if (fresh.state !== 'open') return;
         const next = await reviewCard(fresh);
-        if (card.isConnected && !card.dataset.dirty) card.replaceWith(next);
+        if (card.isConnected && !card.dataset.dirty) swapCard(card, next);
       } catch {
         setTimeout(again, 30000);
       }
@@ -924,6 +924,39 @@ async function reviewCard(pr) {
     setTimeout(again, 15000);
   }
   return card;
+}
+
+/**
+ * Replaces a review card with a newer one without moving the page: the amiibo you were at
+ * (`itemId`, else the first one on screen) stays where it was on screen.
+ */
+function swapCard(card, next, itemId) {
+  const items = [...card.querySelectorAll('.change[data-item]')];
+  const anchor = (itemId && items.find((el) => el.dataset.item === itemId))
+    || items.find((el) => el.getBoundingClientRect().bottom > 0)
+    || card;
+  const top = anchor.getBoundingClientRect().top;
+  const id = anchor.dataset.item;
+  card.replaceWith(next);
+  const again = (id && [...next.querySelectorAll('.change[data-item]')].find((el) => el.dataset.item === id)) || next;
+  window.scrollBy(0, again.getBoundingClientRect().top - top);
+}
+
+/** Reloads one pull request's card in place after a change (falls back to reloading Review). */
+async function refreshReviewCard(card, number, itemId, sha) {
+  if (!card?.isConnected) return showTab('review');
+  try {
+    let fresh = await gh(repoPath(`/pulls/${number}`));
+    // GitHub can take a moment to show the commit just made on the pull request.
+    for (let tries = 0; sha && fresh.head.sha !== sha && tries < 8; tries++) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      fresh = await gh(repoPath(`/pulls/${number}`));
+    }
+    if (fresh.state !== 'open') return showTab('review');
+    swapCard(card, await reviewCard(fresh), itemId);
+  } catch {
+    showTab('review');
+  }
 }
 
 /** Files the Guard protects: a pull request touching any of them must pass it to be merged here. */
@@ -1209,7 +1242,7 @@ function changesView({ data, report, ref, onChange, onEdit }) {
   for (const item of data.items) {
     const { entry } = item;
     const [kindText, kindClass] = KIND_PILL[item.kind];
-    const card = h('div', { class: 'change' });
+    const card = h('div', { class: 'change', 'data-item': item.id });
     const loaders = [];
     const later = (make) => {
       const slot = h('span');
@@ -1569,7 +1602,7 @@ async function dropFromPr({ pr, tool, data, dropped, remember, closeInstead }) {
  * the pull request, and for a tool's pull request the values saved to meta/edits.json, so
  * the tool keeps them when it rebuilds the pull request.
  */
-async function editInPr({ pr, tool, data, item, fields }) {
+async function editInPr({ pr, tool, data, item, fields, card }) {
   const { entry } = item;
   const suggestions = new Map(['amiiboSeries', 'gameSeries', 'character', 'type'].map((key) =>
     [key, [...new Set(data.head.amiibo.map((other) => other[key]).filter(Boolean))].sort()]));
@@ -1604,6 +1637,7 @@ async function editInPr({ pr, tool, data, item, fields }) {
   }
   if (problems.length) return toast(problems.join(' '), true);
   if (!changes.length) return toast('Nothing changed.');
+  let newSha = null;
   const lines = changes.map(([path, value]) => `${fieldLabel(path)}: ${value ?? '(empty)'}`);
   try {
     const ref = await gh(repoPath(`/git/ref/heads/${pr.head.ref}`));
@@ -1621,13 +1655,13 @@ async function editInPr({ pr, tool, data, item, fields }) {
     for (const [path] of changes) {
       provenance[item.id][path] = { source: 'manual', url: null, retrievedAt: new Date().toISOString(), run: `dashboard:${state.user.login}` };
     }
-    await commitToBranch(pr.head.ref, pr.head.sha, {
+    newSha = (await commitToBranch(pr.head.ref, pr.head.sha, {
       files: [
         { path: 'data/catalogue.json', text: catalogueText(catalogue) },
         { path: PROVENANCE, text: `${JSON.stringify(provenance, null, 2)}\n` },
       ],
       message: `Your values for ${entry.name} (Remote Admin)\n\n${lines.map((line) => `- ${line}`).join('\n')}`,
-    });
+    })).sha;
     const note = `Edited in Remote Admin by ${state.user.login}: ${entry.name}\n\n${lines.map((line) => `- ${line}`).join('\n')}${tool?.reports ? `\n\nSaved to ${EDITS}, so ${tool.name} keeps these when it rebuilds this pull request.` : ''}`;
     await gh(repoPath(`/issues/${pr.number}/comments`), { method: 'POST', body: { body: note } }).catch(() => null);
   } catch (error) {
@@ -1649,11 +1683,11 @@ async function editInPr({ pr, tool, data, item, fields }) {
       }, `Your values: ${entry.name} (Remote Admin)`);
     } catch (error) {
       toast(`Saved in the pull request, but couldn’t save your values for ${tool.name} (${error.message}), so its next run may undo them.`, true);
-      return showTab('review');
+      return refreshReviewCard(card, pr.number, item.id, newSha);
     }
   }
   toast(`Saved. The Guard is checking #${pr.number} again; merge when it says Ready.`);
-  showTab('review');
+  await refreshReviewCard(card, pr.number, item.id, newSha);
 }
 
 /** A tool's saved values on its page, with Forget. */
