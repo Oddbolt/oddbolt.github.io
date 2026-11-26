@@ -967,9 +967,19 @@ const GUARDED_PATH = /^(data|images|meta)\//;
  * Actions API, which the dashboard token can use (the checks API needs a Checks permission).
  * Adding a label re-runs the Guard, so the newest run is the one that counts.
  */
+/**
+ * Guard runs that never checked anything: GitHub held them for approval (it does this for
+ * pull requests opened by github-actions[bot]), or they were cancelled or skipped. They are
+ * neither a pass nor a fail.
+ */
+const GUARD_NEVER_RAN = new Set(['action_required', 'waiting', 'requested', 'cancelled', 'skipped', 'stale', 'neutral']);
+
+/** The newest Guard run on a commit that actually ran (or is running). */
 async function latestGuardRun(sha) {
   const data = await gh(repoPath(`/actions/workflows/guard.yml/runs?head_sha=${encodeURIComponent(sha)}&per_page=20`));
-  return data.workflow_runs.sort((a, b) => b.id - a.id)[0] || null;
+  return data.workflow_runs
+    .filter((run) => !GUARD_NEVER_RAN.has(run.status) && !GUARD_NEVER_RAN.has(run.conclusion))
+    .sort((a, b) => b.id - a.id)[0] || null;
 }
 
 /**
