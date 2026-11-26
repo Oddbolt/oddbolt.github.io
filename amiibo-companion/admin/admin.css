@@ -153,9 +153,9 @@ dialog::backdrop { background: rgba(0, 0, 0, .5); }
 .summary .headline { font-size: 19px; font-weight: 700; line-height: 1.3; }
 .summary ul { margin: 4px 0 0; padding-left: 20px; }
 .summary .info li + li { margin-top: 2px; }
-.check { border: 1px solid var(--warn); border-left-width: 4px; border-radius: 8px; padding: 10px 12px; }
-.check strong { color: var(--warn); }
-.check li + li { margin-top: 4px; }
+.to-check { border: 1px solid var(--warn); border-left-width: 4px; border-radius: 8px; padding: 10px 12px; }
+.to-check strong { color: var(--warn); }
+.to-check li + li { margin-top: 4px; }
 .next { border-top: 1px solid var(--border); padding-top: 10px; }
 .banner { border-radius: 10px; padding: 10px 14px; border: 1px solid var(--border); border-left-width: 4px; margin-bottom: 12px; }
 .card .banner { margin-bottom: 0; }
@@ -174,3 +174,33 @@ input.filter { max-width: 300px; margin-top: 0; }
 button.small { padding: 4px 10px; font-size: 13px; }
 table.compact td { padding: 6px; font-size: 14px; }
 table.compact td .small { font-size: 12px; }
+
+/* Review: changes, now vs after merge, with tick boxes */
+.changes { display: grid; gap: 10px; }
+.change { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface); }
+.change.dropped { opacity: .5; }
+.change.dropped .change-head strong { text-decoration: line-through; }
+.change.removed { border-color: var(--danger); }
+.change-head { display: flex; gap: 12px; align-items: center; }
+.change-head .thumb, .change-head img { width: 48px; height: 48px; object-fit: contain; background: var(--raised); border-radius: 8px; flex: none; }
+.change-head .row { gap: 6px; margin-top: 2px; }
+.change-grid { display: grid; grid-template-columns: minmax(150px, 1.1fr) 1fr 1fr minmax(120px, 1.2fr); gap: 6px 14px; margin-top: 10px; font-size: 14px; align-items: center; }
+.change-grid.new { grid-template-columns: max-content max-content 1fr; }
+.change-grid.all { grid-template-columns: minmax(150px, 1.1fr) 1fr 1fr; font-size: 13px; }
+.change-grid .head { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.change-grid .thumb, .change-grid img { width: 40px; height: 40px; object-fit: contain; background: var(--raised); border-radius: 6px; vertical-align: middle; }
+.change-grid .span { grid-column: 2 / -1; }
+.change-grid .off { opacity: .45; text-decoration: line-through; }
+.change details { margin-top: 10px; padding: 6px 10px; }
+label.keep { display: inline-flex; gap: 6px; align-items: center; margin: 0; font-size: 14px; font-weight: 600; color: var(--text); cursor: pointer; }
+label.keep input { width: auto; margin: 0; accent-color: var(--accent); }
+.change-head label.keep { margin-left: auto; }
+.dropbar { position: sticky; bottom: 0; z-index: 2; background: var(--surface); border-top: 1px solid var(--border); padding: 10px 0 4px; }
+.dropbar label.check { margin: 0; }
+@media (max-width: 640px) {
+  /* Change on its own line, then now | after, then why. */
+  .change-grid:not(.new):not(.all) { grid-template-columns: 1fr 1fr; }
+  .change-grid:not(.new):not(.all) > :nth-child(4n + 1),
+  .change-grid:not(.new):not(.all) > :nth-child(4n) { grid-column: 1 / -1; }
+  .change-grid:not(.new):not(.all) > .head:nth-child(4n) { display: none; }
+}

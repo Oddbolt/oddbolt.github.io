@@ -40,6 +40,7 @@ const TOOLS = [
       unmatched: { title: 'Not added', help: 'A source lists these, but they weren’t added. Almost all are older amiibo we already have under a slightly different name: nothing to do. Act only on lines that say “add by hand”, or if one is really missing.', fold: true },
       filled: { title: 'Filled', help: 'Empty fields on amiibo we already have, filled from a source.' },
       conflicts: { title: 'Sources disagree (not applied)', help: 'The sources gave different values, so nothing was changed.', fold: true },
+      skipped: { title: 'Skipped by you', help: 'You dropped these from an earlier pull request, so they were left out. Allow one again on this tool’s page.', fold: true },
     },
     brief: (counts) => (counts.added || counts.promoted
       ? [counts.added ? `${counts.added} new amiibo` : '', counts.promoted ? `${counts.promoted} real id${counts.promoted === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ')
@@ -62,6 +63,7 @@ const TOOLS = [
       disagreements: { title: 'A source disagrees (not changed)', help: 'Ours stays as it is. Usually ours is right (sources mix up re-releases and bundles). If the source is right, fix it with Edit; the tools never overwrite your edits.', fold: true },
       kept: { title: 'Your edits kept', help: 'You set these by hand, so the tool left them alone even though a source says otherwise.', fold: true },
       notMatched: { title: 'Same name, different series (not used)', help: 'A source has an amiibo with the same name as one of ours but in another series, so it was ignored (for example Monster Hunter’s Rudy and Animal Crossing’s Rudy).', fold: true },
+      skipped: { title: 'Skipped by you', help: 'You dropped these from an earlier pull request, so they were left out. Allow one again on this tool’s page.', fold: true },
     },
     brief: (counts) => (counts.changes ? `${counts.changes} change${counts.changes === 1 ? '' : 's'}` : 'Nothing to change'),
     explain: explainDbUpdate,
@@ -648,11 +650,12 @@ async function showTools(toolId, kind, runId) {
  */
 async function refreshToolLive(tool, live, hash) {
   clearTimeout(state.pollTimer);
-  const [index, runs, latest, pulls] = await Promise.all([
+  const [index, runs, latest, pulls, skipList] = await Promise.all([
     fileJson(`${tool.id}/index.json`, REPORTS_BRANCH).catch(() => null),
     gh(repoPath(`/actions/workflows/${tool.workflow}/runs?per_page=15`)).catch(() => ({ workflow_runs: [] })),
     fileJson(`${tool.id}/latest.json`, REPORTS_BRANCH).catch(() => null),
     gh(repoPath('/pulls?state=open&per_page=30')).catch(() => []),
+    readSkipList().catch(() => ({ data: {} })),
   ]);
   if (currentHash !== hash || !live.isConnected) return;
   const list = index || [];
@@ -691,6 +694,7 @@ async function refreshToolLive(tool, live, hash) {
         list.length ? h('button', { type: 'button', class: 'ghost', onclick: () => exportRuns(tool, list) }, 'Export recent runs') : null),
       h('p', { class: 'small muted' }, 'Tap a run for its full report.'),
       runList(tool, rows)),
+    skippedCard(tool, Array.isArray(skipList.data[tool.id]) ? skipList.data[tool.id] : []),
   ].filter(Boolean));
 
   if (rows.some((row) => row.active)) {
@@ -780,14 +784,20 @@ async function reviewCard(pr) {
   const card = h('div', { class: 'card stack' });
   const tool = toolForBranch(pr.head.ref);
   const runId = tool?.reports ? (pr.body || '').match(/\brun (\d+|local-\d+)/)?.[1] : null;
-  const [checks, guardRun, files, report] = await Promise.all([
+  const [checks, guardRun, files, report, headCommit] = await Promise.all([
     gh(repoPath(`/commits/${pr.head.sha}/check-runs`)).catch(() => ({ check_runs: [] })),
     latestGuardRun(pr.head.sha).catch(() => null),
     gh(repoPath(`/pulls/${pr.number}/files?per_page=100`)),
     runId ? fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH).catch(() => null) : null,
+    gh(repoPath(`/git/commits/${pr.head.sha}`)).catch(() => null),
   ]);
+  const data = files.some((file) => file.filename === 'data/catalogue.json') ? await prChanges(pr).catch((error) => ({ error })) : null;
+  // Still exactly what the tool made? Once you've dropped something it's an ordinary pull
+  // request again: its new commit needs its own Guard run.
+  const toolCommit = !tool?.reports || headCommit?.author?.name === 'github-actions[bot]';
   const guardOutcome = report?.guard?.outcome ?? null;
-  const guard = guardState({ tool, toolOutcome: guardOutcome, guardRun, files });
+  const guard = guardState({ tool, toolOutcome: guardOutcome, toolCommit, guardRun, files });
+  const blocked = guard === 'failed' || guard === 'no report';
   const failing = checks.check_runs.filter((run) => run.conclusion === 'failure' && !/guard/i.test(run.name));
   const status = mergeStatus(guard, failing);
   const checkPills = checks.check_runs.map((run) =>
@@ -804,11 +814,56 @@ async function reviewCard(pr) {
     h('div', { class: `banner is-${status.kind}` }, h('strong', {}, status.title), ' ', status.text),
   );
   if (tool?.reports && report) {
-    card.append(h('h3', {}, 'What merging does'), runSummary(tool, report, { review: true }), reportSections(tool, report, pr.head.ref));
+    card.append(h('h3', {}, 'What the run found'), runSummary(tool, report, { review: true }));
+    if (!toolCommit) card.append(h('p', { class: 'small warn' }, 'You’ve dropped some of this since the run, so “Changes” below (what’s in it now) differs from the run’s numbers.'));
   } else if (tool?.reports) {
     card.append(h('p', { class: 'warn' }, 'Couldn’t find the report for this run. Its description from GitHub:'), h('pre', {}, pr.body || ''));
   } else {
-    card.append(h('h3', {}, 'What merging does'), h('pre', {}, pr.body || '(no description)'));
+    card.append(h('h3', {}, 'Description'), h('pre', {}, pr.body || '(no description)'));
+  }
+
+  const mergeButton = h('button', { type: 'button', disabled: blocked, onclick: () => mergePr(pr, files, guardOutcome) }, 'Merge');
+  const mergeHint = h('span', { class: 'small warn', hidden: true }, 'Drop the unticked changes first, or tick them again.');
+  if (data && !data.error && data.items.length) {
+    const dropInfo = h('span', { class: 'small' });
+    const remember = tool?.reports ? h('input', { type: 'checkbox', checked: true }) : null;
+    const dropButton = h('button', { type: 'button', class: 'danger', disabled: true }, 'Drop unticked');
+    const onlyCatalogue = data.files.every((file) => /^(data\/catalogue\.json|meta\/provenance\.json|images\/)/.test(file.filename))
+      && !data.items.some((item) => item.kind === 'removed');
+    let changes;
+    const update = () => {
+      const dropped = changes.dropped();
+      const count = droppedCount(dropped);
+      const everything = count > 0 && count === changes.total && onlyCatalogue;
+      card.dataset.dirty = count ? 'yes' : '';
+      mergeButton.disabled = blocked || count > 0;
+      mergeHint.hidden = count === 0;
+      dropButton.disabled = count === 0;
+      dropButton.textContent = everything ? 'Drop all and close' : count ? `Drop ${count}` : 'Drop unticked';
+      dropInfo.textContent = count
+        ? `Dropping ${count} of ${changes.total}: ${someNames(dropped.map(describeDropped), 3)}.`
+        : `Keeping all ${plural(changes.total, 'change')}. Untick anything you don’t want, then Drop.`;
+      dropButton.onclick = () => dropFromPr({ pr, tool, data, dropped: changes.dropped(), remember: Boolean(remember?.checked), closeInstead: everything });
+    };
+    changes = changesView({ data, report, ref: pr.head.sha, onChange: update });
+    const counts = ['added', 'promoted', 'changed', 'removed'].map((kind) => [kind, data.items.filter((item) => item.kind === kind).length]).filter(([, n]) => n);
+    const words = { added: 'new', promoted: 'real ids', changed: 'changed', removed: 'removed' };
+    card.append(
+      h('h3', {}, `Changes: ${counts.map(([kind, n]) => `${n} ${words[kind]}`).join(', ')}`),
+      h('p', { class: 'small muted' }, 'Each amiibo as it is now next to how it will be after merging (only what changes; “All details” shows the rest). Everything ticked gets merged.'),
+      changes.node,
+      h('div', { class: 'dropbar stack' },
+        dropInfo,
+        h('div', { class: 'row' },
+          dropButton,
+          remember ? h('label', { class: 'check' }, remember, `Don’t let ${tool.name} propose dropped ones again`) : null)));
+    update();
+  } else if (data?.error) {
+    card.append(h('p', { class: 'warn' }, `Couldn’t compare the changes: ${data.error.message}`));
+  }
+  if (tool?.reports && report) {
+    const omit = data && !data.error ? [tool.main, 'promoted', 'filled'] : [];
+    card.append(h('h3', {}, 'More from the run'), reportSections(tool, report, pr.head.ref, { omit }));
   }
   if (files.some((file) => file.filename === 'data/catalogue.json')) {
     const holder = h('div');
@@ -835,9 +890,29 @@ async function reviewCard(pr) {
       h('ul', { class: 'list small' }, files.slice(0, 30).map((file) =>
         h('li', {}, `${file.status} ${file.filename} (+${file.additions} −${file.deletions})`)))),
     h('div', { class: 'row' },
-      h('button', { type: 'button', disabled: guard === 'failed' || guard === 'no report', onclick: () => mergePr(pr, files, guardOutcome) }, 'Merge'),
-      h('button', { type: 'button', class: 'ghost', onclick: () => closePr(pr) }, 'Close without merging')),
+      mergeButton,
+      h('button', { type: 'button', class: 'ghost', onclick: () => closePr(pr) }, 'Close without merging'),
+      mergeHint),
   );
+  // While the Guard runs, check again every 15 s (not while you're ticking boxes).
+  if (guard === 'running' || guard === 'not started') {
+    const again = async () => {
+      if (!card.isConnected || card.dataset.dirty) return;
+      if (document.hidden) {
+        setTimeout(again, 15000);
+        return;
+      }
+      try {
+        const fresh = await gh(repoPath(`/pulls/${pr.number}`));
+        if (fresh.state !== 'open') return;
+        const next = await reviewCard(fresh);
+        if (card.isConnected && !card.dataset.dirty) card.replaceWith(next);
+      } catch {
+        setTimeout(again, 30000);
+      }
+    };
+    setTimeout(again, 15000);
+  }
   return card;
 }
 
@@ -859,13 +934,13 @@ async function latestGuardRun(sha) {
  * (a tool's report is missing) or not needed (no data files). Fails closed: a data pull
  * request counts as passed only with a passing result.
  */
-function guardState({ tool, toolOutcome, guardRun, files }) {
+function guardState({ tool, toolOutcome, toolCommit = true, guardRun, files }) {
   // 100 = the most the files list returns, so there may be data files beyond it.
   const touchesData = files.length >= 100 || files.some((file) => GUARDED_PATH.test(file.filename));
   // The tools open their pull requests as GitHub Actions, which doesn't start the Guard
   // workflow, so they run the Guard themselves and their report has the result.
   const results = [];
-  if (tool?.reports) results.push(toolOutcome || 'no report');
+  if (tool?.reports && toolCommit) results.push(toolOutcome || 'no report');
   if (guardRun) results.push(guardRun.status === 'completed' ? guardRun.conclusion : 'running');
   if (touchesData && results.length === 0) results.push('not started');
   if (results.includes('no report')) return 'no report';
@@ -900,7 +975,10 @@ async function mergePr(pr, files, toolGuardOutcome) {
     return toast(`Couldn’t read the Guard check: ${error.message}`, true);
   }
   const checkRuns = (await gh(repoPath(`/commits/${pr.head.sha}/check-runs?per_page=100`)).catch(() => null))?.check_runs || [];
-  const guard = guardState({ tool: toolForBranch(pr.head.ref), toolOutcome: toolGuardOutcome, guardRun, files });
+  const tool = toolForBranch(pr.head.ref);
+  const headCommit = await gh(repoPath(`/git/commits/${pr.head.sha}`)).catch(() => null);
+  const toolCommit = !tool?.reports || headCommit?.author?.name === 'github-actions[bot]';
+  const guard = guardState({ tool, toolOutcome: toolGuardOutcome, toolCommit, guardRun, files });
   if (guard === 'no report') {
     return toast('Couldn’t find the report for this run, so the Guard result is unknown. Review it on GitHub.', true);
   }
@@ -935,6 +1013,533 @@ async function closePr(pr) {
   } catch (error) {
     toast(`Couldn’t close: ${error.message}`, true);
   }
+}
+
+// ─── Changes in a pull request: compare, keep or drop ──────────────
+
+/** Fields in the order people read them; anything else follows. Never shown: ids, aliases. */
+const FIELD_ORDER = ['name', 'character', 'amiiboSeries', 'gameSeries', 'type', 'release.na', 'release.eu', 'release.jp', 'release.au', 'image', 'imageFallback', 'source'];
+const HIDDEN_FIELDS = new Set(['id', 'head', 'tail', 'aliases', 'release']);
+const SKIPPED = 'meta/skipped.json';
+
+const fieldGet = (entry, path) => (path.startsWith('release.') ? entry.release?.[path.slice(8)] : entry[path]) ?? null;
+const orderOf = (path) => (FIELD_ORDER.includes(path) ? FIELD_ORDER.indexOf(path) : FIELD_ORDER.length);
+
+function entryFields(entry) {
+  return [...Object.keys(entry).filter((key) => !HIDDEN_FIELDS.has(key)), ...Object.keys(entry.release || {}).map((region) => `release.${region}`)];
+}
+
+/** Puts a field back the way it was in `old` (removing it if `old` didn't have it). */
+function restoreField(entry, old, path) {
+  if (path.startsWith('release.')) {
+    entry.release[path.slice(8)] = old.release?.[path.slice(8)] ?? null;
+  } else if (Object.hasOwn(old, path)) {
+    entry[path] = structuredClone(old[path]);
+  } else {
+    delete entry[path];
+  }
+}
+
+function restoreProvenance(provenance, baseProvenance, id, path) {
+  const before = baseProvenance?.[id]?.[path];
+  if (before) {
+    provenance[id] ??= {};
+    provenance[id][path] = structuredClone(before);
+  } else if (provenance[id]) {
+    delete provenance[id][path];
+    if (!Object.keys(provenance[id]).length) delete provenance[id];
+  }
+}
+
+/** Every file a pull request touches (the list comes 100 at a time). */
+async function allPrFiles(number) {
+  const files = [];
+  for (let page = 1; page <= 30; page++) {
+    const batch = await gh(repoPath(`/pulls/${number}/files?per_page=100&page=${page}`));
+    files.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return files;
+}
+
+/**
+ * What a pull request does to the catalogue, per amiibo, against the commit it started
+ * from: added, removed, a real id for a temporary one (promoted), or changed fields. A
+ * picture is one row even when its backup URL changes with it, or when only its file is new.
+ */
+async function prChanges(pr) {
+  const compare = await gh(repoPath(`/compare/main...${pr.head.sha}?per_page=1`));
+  const baseSha = compare.merge_base_commit.sha;
+  const [base, head, files] = await Promise.all([
+    fileJson('data/catalogue.json', baseSha),
+    fileJson('data/catalogue.json', pr.head.sha),
+    allPrFiles(pr.number),
+  ]);
+  const newFiles = new Set(files.filter((file) => file.status === 'added').map((file) => file.filename));
+  return { baseSha, base, head, files, newFiles, items: diffCatalogues(base, head, newFiles) };
+}
+
+function diffCatalogues(base, head, newFiles) {
+  const baseById = new Map(base.amiibo.map((entry) => [entry.id, entry]));
+  const headIds = new Set(head.amiibo.map((entry) => entry.id));
+  const items = [];
+  for (const entry of head.amiibo) {
+    let old = baseById.get(entry.id);
+    const from = old ? null : (entry.aliases || []).find((alias) => baseById.has(alias) && !headIds.has(alias)) || null;
+    if (from) old = baseById.get(from);
+    if (!old) {
+      items.push({ kind: 'added', key: `amiibo:${entry.id}`, id: entry.id, entry });
+      continue;
+    }
+    const paths = [...new Set([...entryFields(old), ...entryFields(entry)])]
+      .filter((path) => JSON.stringify(fieldGet(old, path)) !== JSON.stringify(fieldGet(entry, path)))
+      .sort((a, b) => orderOf(a) - orderOf(b));
+    const pictureFileOnly = !paths.includes('image') && entry.image && entry.image !== PLACEHOLDER_IMAGE && newFiles.has(entry.image);
+    if (!from && !paths.length && !pictureFileOnly) continue;
+    const rows = [];
+    const picture = paths.includes('image') || pictureFileOnly;
+    for (const path of paths) {
+      if (path === 'imageFallback' && picture) continue;
+      if (path === 'image') continue;
+      rows.push({ key: `field:${entry.id}:${path}`, label: fieldLabel(path), paths: [path], before: fieldGet(old, path), after: fieldGet(entry, path), skipField: path, skipValue: fieldGet(entry, path) });
+    }
+    if (picture) {
+      rows.push({
+        key: `field:${entry.id}:image`,
+        label: 'Picture',
+        paths: ['image', ...(paths.includes('imageFallback') ? ['imageFallback'] : [])],
+        before: pictureFileOnly ? null : fieldGet(old, 'image'),
+        after: entry.image,
+        file: newFiles.has(entry.image) ? entry.image : null,
+        picture: true,
+        skipField: 'image',
+        skipValue: null,
+      });
+      rows.sort((a, b) => orderOf(a.paths[0]) - orderOf(b.paths[0]));
+    }
+    items.push(from
+      ? { kind: 'promoted', key: `amiibo:${entry.id}`, id: entry.id, from, old, entry, rows }
+      : { kind: 'changed', key: `amiibo:${entry.id}`, id: entry.id, old, entry, rows });
+  }
+  const promotedFrom = new Set(items.filter((item) => item.kind === 'promoted').map((item) => item.from));
+  for (const entry of base.amiibo) {
+    if (!headIds.has(entry.id) && !promotedFrom.has(entry.id)) items.push({ kind: 'removed', key: `amiibo:${entry.id}`, id: entry.id, old: entry, entry });
+  }
+  const rank = { added: 0, promoted: 1, changed: 2, removed: 3 };
+  return items.sort((a, b) => rank[a.kind] - rank[b.kind] || a.entry.name.localeCompare(b.entry.name));
+}
+
+/** What the tool's report says about each change: why, from where, what was guessed. */
+function reportInfo(report) {
+  const sections = report?.sections || {};
+  return {
+    added: new Map((sections.added || []).map((item) => [item.id, item])),
+    changes: new Map([...(sections.changes || []), ...(sections.filled || [])].map((item) => [`${item.id}|${item.field}`, item])),
+    promoted: new Map((sections.promoted || []).map((item) => [item.to, item])),
+  };
+}
+
+/** SNM's note for one field of a new amiibo ("guessed", "series' launch date"…). */
+function guessNote(guessed, path) {
+  const find = (pattern) => guessed.find((text) => pattern.test(text));
+  if (path === 'amiiboSeries') return find(/amiibo series/);
+  if (path === 'gameSeries') return find(/^game series/);
+  if (path === 'character') return find(/^character/) ? 'taken from the name' : null;
+  if (path === 'type') return find(/^type assumed/) ? 'assumed' : null;
+  if (path.startsWith('release.')) {
+    const text = find(/launch date/);
+    return text && text.split(' ')[0].split('/').includes(path.slice(8).toUpperCase()) ? 'series’ launch date' : null;
+  }
+  return null;
+}
+
+/** A picture cell: the published one for "now", the pull request's own file for "after". */
+function pictureCell(path, ref) {
+  if (!path) return h('span', { class: 'muted' }, 'none');
+  if (path === PLACEHOLDER_IMAGE) return h('span', { class: 'muted' }, 'our icon (no picture)');
+  if (/^https:/.test(path)) return link('picture', path);
+  if (!ref) return amiiboImage({ name: '', image: path, imageFallback: null });
+  return repoImage(path, ref, '');
+}
+
+const KIND_PILL = { added: ['New', 'ok'], promoted: ['Real id', 'ok'], changed: ['Changed', 'warn'], removed: ['Removed', 'error'] };
+
+/**
+ * The changes, one card per amiibo, "Now" next to "After merge", with a tick box on every
+ * change (a whole new amiibo, a real id, or one field). onChange runs when a box changes.
+ * Returns { node, dropped(), total, describe(dropped) }.
+ */
+function changesView({ data, report, ref, onChange }) {
+  const info = reportInfo(report);
+  const keep = new Map();
+  const boxes = [];
+  const cards = [];
+  const LIMIT = 20;
+
+  const box = (key, label, onToggle) => {
+    keep.set(key, true);
+    const input = h('input', { type: 'checkbox', checked: true });
+    input.addEventListener('change', () => {
+      keep.set(key, input.checked);
+      onToggle?.();
+      onChange();
+    });
+    boxes.push(input);
+    return h('label', { class: 'keep' }, input, label);
+  };
+
+  for (const item of data.items) {
+    const { entry } = item;
+    const [kindText, kindClass] = KIND_PILL[item.kind];
+    const card = h('div', { class: 'change' });
+    const loaders = [];
+    const later = (make) => {
+      const slot = h('span');
+      loaders.push(() => slot.replaceWith(make()));
+      return slot;
+    };
+    const head = h('div', { class: 'change-head' },
+      later(() => (item.kind === 'added' || item.kind === 'promoted' ? pictureCell(entry.image, ref) : amiiboImage(entry))),
+      h('div', { class: 'grow' },
+        h('div', {}, h('strong', {}, entry.name), h('span', { class: 'muted' }, ` · ${entry.amiiboSeries}`)),
+        h('div', { class: 'small muted row' }, pill(kindText, kindClass), h('code', {}, item.kind === 'promoted' ? `${item.from} → ${item.id}` : item.id))));
+
+    if (item.kind === 'added') {
+      const about = info.added.get(item.id);
+      const guessed = about?.guessed || [];
+      const update = () => card.classList.toggle('dropped', !keep.get(item.key));
+      head.append(box(item.key, 'Keep', update));
+      const rows = ['amiiboSeries', 'gameSeries', 'character', 'type'].map((path) => {
+        const note = guessNote(guessed, path);
+        return [fieldLabel(path), String(fieldGet(entry, path) ?? ''), note ? h('span', { class: path === 'character' ? 'muted' : 'warn' }, note) : ''];
+      });
+      const dates = REGIONS.map((region) => {
+        const value = entry.release?.[region];
+        const note = guessNote(guessed, `release.${region}`);
+        return `${region.toUpperCase()} ${value ? appDate(value) : '—'}${note ? ` (${note})` : ''}`;
+      }).join(' · ');
+      card.append(head,
+        h('div', { class: 'change-grid new' },
+          rows.flatMap(([label, value, note]) => [h('span', { class: 'muted' }, label), h('span', {}, value), h('span', { class: 'small' }, note)]),
+          h('span', { class: 'muted' }, 'Released'), h('span', { class: 'span' }, dates)),
+        about && (about.sources?.length || about.url)
+          ? h('div', { class: 'small muted' }, about.sources?.length ? `From ${joinAnd(about.sources)}` : 'Source', about.url ? [about.sources?.length ? ' · ' : ': ', link('page', about.url)] : null)
+          : null);
+    } else if (item.kind === 'promoted') {
+      const update = () => card.classList.toggle('dropped', !keep.get(item.key));
+      head.append(box(item.key, 'Keep', update));
+      card.append(head,
+        h('p', { class: 'small muted' }, 'AmiiboAPI now lists this amiibo with its real id. Merging switches to it; the app moves copies and wishlist entries over by itself.'),
+        item.rows.length ? h('div', { class: 'change-grid' }, gridHeader(), item.rows.flatMap((row) => changeRow(row, null, ref))) : null);
+    } else if (item.kind === 'changed') {
+      const all = item.rows.length > 1 ? h('input', { type: 'checkbox', checked: true }) : null;
+      const rowNodes = [];
+      const update = () => {
+        const kept = item.rows.filter((row) => keep.get(row.key)).length;
+        card.classList.toggle('dropped', kept === 0);
+        item.rows.forEach((row, index) => rowNodes[index].forEach((node) => node.classList.toggle('off', !keep.get(row.key))));
+        if (all) {
+          all.checked = kept === item.rows.length;
+          all.indeterminate = kept > 0 && kept < item.rows.length;
+        }
+      };
+      if (all) {
+        all.addEventListener('change', () => {
+          for (const row of item.rows) keep.set(row.key, all.checked);
+          for (const input of card.querySelectorAll('.change-grid input')) input.checked = all.checked;
+          update();
+          onChange();
+        });
+        head.append(h('label', { class: 'keep' }, all, 'Keep all'));
+      }
+      const grid = h('div', { class: 'change-grid' }, gridHeader());
+      for (const row of item.rows) {
+        const about = info.changes.get(`${item.id}|${row.paths[0]}`);
+        const nodes = changeRow(row, box(row.key, row.label, update), ref, about);
+        rowNodes.push(nodes);
+        grid.append(...nodes);
+      }
+      card.append(head, grid,
+        details('All details',
+          h('div', { class: 'change-grid all' }, gridHeader(true),
+            [...new Set([...entryFields(item.old), ...entryFields(entry)])].sort((a, b) => orderOf(a) - orderOf(b)).flatMap((path) => {
+              const same = JSON.stringify(fieldGet(item.old, path)) === JSON.stringify(fieldGet(entry, path));
+              return [h('span', { class: 'muted' }, fieldLabel(path)), h('span', { class: same ? 'muted' : '' }, fieldValue(path, fieldGet(item.old, path))), h('span', { class: same ? 'muted' : '' }, fieldValue(path, fieldGet(entry, path)))];
+            }))));
+    } else {
+      card.classList.add('removed');
+      card.append(head, h('p', { class: 'small' }, 'This pull request removes it. To keep it, close the pull request instead of merging.'));
+    }
+    card.load = () => {
+      for (const load of loaders.splice(0)) load();
+    };
+    cards.push({ card, text: `${entry.name} ${entry.amiiboSeries} ${item.id} ${item.from || ''}`.toLowerCase() });
+  }
+
+  // Long lists: the first 20, "Show all", and a filter.
+  let showAll = cards.length <= LIMIT;
+  let query = '';
+  const list = h('div', { class: 'changes' }, cards.map(({ card }) => card));
+  const more = h('button', { type: 'button', class: 'ghost small', onclick: () => { showAll = true; render(); } }, `Show all ${cards.length}`);
+  const render = () => {
+    let shown = 0;
+    for (const { card, text } of cards) {
+      const visible = query ? text.includes(query) : showAll || shown < LIMIT;
+      card.hidden = !visible;
+      if (visible) {
+        shown++;
+        card.load();
+      }
+    }
+    more.hidden = showAll || Boolean(query);
+  };
+  const setAll = (value) => {
+    for (const input of boxes) {
+      if (input.checked !== value) {
+        input.checked = value;
+        input.dispatchEvent(new Event('change'));
+      }
+    }
+  };
+  render();
+
+  const units = () => data.items.flatMap((item) => (item.kind === 'changed' ? item.rows.map((row) => ({ item, row })) : item.kind === 'removed' ? [] : [{ item }]));
+  return {
+    node: h('div', { class: 'stack' },
+      h('div', { class: 'row' },
+        cards.length > LIMIT ? h('input', { type: 'search', class: 'filter', placeholder: 'Filter by name, series or id', autocomplete: 'off', oninput: (event) => { query = event.target.value.trim().toLowerCase(); render(); } }) : null,
+        h('button', { type: 'button', class: 'ghost small', onclick: () => setAll(true) }, 'Tick all'),
+        h('button', { type: 'button', class: 'ghost small', onclick: () => setAll(false) }, 'Untick all')),
+      list,
+      more),
+    total: units().length,
+    /** Unticked changes: { item } for a whole amiibo, { item, rows } for fields. */
+    dropped: () => {
+      const out = [];
+      for (const item of data.items) {
+        if (item.kind === 'changed') {
+          const rows = item.rows.filter((row) => !keep.get(row.key));
+          if (rows.length) out.push({ item, rows });
+        } else if (item.kind !== 'removed' && !keep.get(item.key)) {
+          out.push({ item });
+        }
+      }
+      return out;
+    },
+  };
+}
+
+function gridHeader(compact = false) {
+  return [h('span', { class: 'head' }, compact ? '' : 'Change'), h('span', { class: 'head' }, 'Now'), h('span', { class: 'head' }, 'After merge'), ...(compact ? [] : [h('span', { class: 'head' }, '')])];
+}
+
+/** One changed field: [label or tick box, now, after merge, why]. */
+function changeRow(row, label, ref, about) {
+  const before = row.picture ? pictureCell(row.before, null) : fieldValue(row.paths[0], row.before);
+  const after = row.picture ? pictureCell(row.after, ref) : fieldValue(row.paths[0], row.after);
+  const why = about
+    ? h('span', { class: 'small muted' }, WHY_TEXT[about.why] ? WHY_TEXT[about.why].replace(/^./, (c) => c.toUpperCase()) : about.why || '', about.source ? ` · ${about.source}` : '', about.url ? [' · ', link('page', about.url)] : null)
+    : h('span');
+  return [label || h('span', { class: 'muted' }, row.label), h('span', {}, before), h('span', {}, after), why];
+}
+
+/** "Big Man (new amiibo)", "Rudy: Release date, Europe". */
+function describeDropped({ item, rows }) {
+  if (item.kind === 'added') return `${item.entry.name} (new amiibo)`;
+  if (item.kind === 'promoted') return `${item.entry.name} (real id ${item.id})`;
+  return `${item.entry.name}: ${rows.map((row) => row.label).join(', ')}`;
+}
+
+function droppedCount(dropped) {
+  return dropped.reduce((sum, { rows }) => sum + (rows ? rows.length : 1), 0);
+}
+
+/** What goes on the skip list for each dropped change. */
+function skipEntries({ item, rows }) {
+  const stamp = { at: new Date().toISOString(), by: state.user.login };
+  if (item.kind === 'added') return [{ name: item.entry.name, amiiboSeries: item.entry.amiiboSeries, ...stamp }];
+  if (item.kind === 'promoted') return [{ name: item.entry.name, from: item.from, to: item.id, ...stamp }];
+  return rows.map((row) => ({ name: `${item.entry.name}: ${row.label}`, id: item.id, field: row.skipField, value: row.skipValue, ...stamp }));
+}
+
+function base64ToUtf8(base64) {
+  const binary = atob(base64.replace(/\s/g, ''));
+  return new TextDecoder().decode(Uint8Array.from(binary, (char) => char.charCodeAt(0)));
+}
+
+/** The skip list on main, with its file sha (null if it doesn't exist yet). */
+async function readSkipList() {
+  try {
+    const meta = await gh(repoPath(`/contents/${SKIPPED}?ref=main`));
+    return { sha: meta.sha, data: JSON.parse(base64ToUtf8(meta.content)) };
+  } catch (error) {
+    if (error.status === 404) return { sha: null, data: {} };
+    throw error;
+  }
+}
+
+/**
+ * Changes the skip list straight on main: it isn't published data, and a tool run must see
+ * it before the pull request is merged. Retries once if it changed meanwhile.
+ */
+async function writeSkipList(mutate, message) {
+  for (let attempt = 0; ; attempt++) {
+    const { sha, data } = await readSkipList();
+    data.about = 'What you dropped in Remote Admin. The tools don’t propose these again. To undo one, use Allow again on the tool’s page in Remote Admin.';
+    mutate(data);
+    try {
+      await gh(repoPath(`/contents/${SKIPPED}`), {
+        method: 'PUT',
+        body: { message, content: utf8ToBase64(`${JSON.stringify(data, null, 2)}\n`), branch: 'main', ...(sha ? { sha } : {}) },
+      });
+      return;
+    } catch (error) {
+      if (attempt >= 1 || ![409, 422].includes(error.status)) throw error;
+    }
+  }
+}
+
+/** One commit on a branch: these files written, these deleted. Fails if the branch moved. */
+async function commitToBranch(branch, parentSha, { files, deletions = [], message }) {
+  const parent = await gh(repoPath(`/git/commits/${parentSha}`));
+  const tree = [];
+  for (const file of files) {
+    const blob = await gh(repoPath('/git/blobs'), { method: 'POST', body: { content: utf8ToBase64(file.text), encoding: 'base64' } });
+    tree.push({ path: file.path, mode: '100644', type: 'blob', sha: blob.sha });
+  }
+  for (const path of deletions) tree.push({ path, mode: '100644', type: 'blob', sha: null });
+  const newTree = await gh(repoPath('/git/trees'), { method: 'POST', body: { base_tree: parent.tree.sha, tree } });
+  const commit = await gh(repoPath('/git/commits'), { method: 'POST', body: { message, tree: newTree.sha, parents: [parentSha] } });
+  await gh(repoPath(`/git/refs/heads/${branch}`), { method: 'PATCH', body: { sha: commit.sha, force: false } });
+  return commit;
+}
+
+/**
+ * Takes the unticked changes out of a pull request with one commit on its branch (or
+ * closes it when nothing would be left), notes it on the pull request, and for a tool's
+ * pull request puts them on the skip list so the tool doesn't propose them again.
+ */
+async function dropFromPr({ pr, tool, data, dropped, remember, closeInstead }) {
+  const lines = dropped.map(describeDropped);
+  const count = droppedCount(dropped);
+  const body = [
+    h('ul', {}, lines.slice(0, 15).map((line) => h('li', {}, line)), lines.length > 15 ? h('li', {}, `…and ${lines.length - 15} more`) : null),
+    closeInstead
+      ? 'Nothing would be left, so this closes the pull request without merging. The data doesn’t change.'
+      : 'They come out of this pull request as one new commit. The Guard then checks it again (about a minute) before you can merge the rest.',
+    tool?.reports
+      ? remember
+        ? `${tool.name} won’t propose ${count === 1 ? 'it' : 'them'} again. To undo: Tools > ${tool.name} > Skipped by you > Allow again.`
+        : `The next ${tool.name} run may propose ${count === 1 ? 'it' : 'them'} again.`
+      : null,
+  ].filter(Boolean);
+  const title = closeInstead ? `Drop everything and close #${pr.number}?` : `Drop ${plural(count, 'change')} from #${pr.number}?`;
+  if (!(await confirmDialog(title, body, closeInstead ? 'Close pull request' : 'Drop', true))) return;
+  const note = `Dropped in Remote Admin by ${state.user.login}:\n\n${lines.map((line) => `- ${line}`).join('\n')}${remember ? `\n\nSaved to ${SKIPPED}, so ${tool.name} won't propose ${count === 1 ? 'it' : 'them'} again.` : ''}`;
+  try {
+    if (closeInstead) {
+      await gh(repoPath(`/pulls/${pr.number}`), { method: 'PATCH', body: { state: 'closed' } });
+    } else {
+      const ref = await gh(repoPath(`/git/ref/heads/${pr.head.ref}`));
+      if (ref.object.sha !== pr.head.sha) {
+        return toast('This pull request changed since the page loaded (a new run?). Open Review again and redo your ticks.', true);
+      }
+      const [headProvenance, baseProvenance] = await Promise.all([
+        fileJson(PROVENANCE, pr.head.sha).catch(() => null),
+        fileJson(PROVENANCE, data.baseSha).catch(() => null),
+      ]);
+      const catalogue = structuredClone(data.head);
+      const provenance = headProvenance ? structuredClone(headProvenance) : null;
+      const position = new Map(catalogue.amiibo.map((entry, index) => [entry.id, index]));
+      const freedImages = new Set();
+      for (const { item, rows } of dropped) {
+        const index = position.get(item.id);
+        if (item.kind === 'added') {
+          catalogue.amiibo[index] = null;
+          freedImages.add(item.entry.image);
+          if (provenance) delete provenance[item.id];
+        } else if (item.kind === 'promoted') {
+          catalogue.amiibo[index] = structuredClone(item.old);
+          freedImages.add(item.entry.image);
+          if (provenance) {
+            delete provenance[item.id];
+            if (baseProvenance?.[item.from]) provenance[item.from] = structuredClone(baseProvenance[item.from]);
+          }
+        } else {
+          const entry = catalogue.amiibo[index];
+          for (const row of rows) {
+            if (row.file) freedImages.add(row.file);
+            for (const path of row.paths) {
+              restoreField(entry, item.old, path);
+              if (provenance) restoreProvenance(provenance, baseProvenance, item.id, path);
+            }
+          }
+        }
+      }
+      catalogue.amiibo = catalogue.amiibo.filter(Boolean).sort((a, b) => a.id.localeCompare(b.id));
+      catalogue.count = catalogue.amiibo.length;
+      // A picture file this pull request added goes too, unless an amiibo still uses it (a
+      // picture row whose file was all that changed keeps its path, so it's deleted anyway).
+      const fileOnly = new Set(dropped.flatMap(({ rows }) => (rows || []).filter((row) => row.file && row.before === null).map((row) => row.file)));
+      const inUse = new Set(catalogue.amiibo.map((entry) => entry.image));
+      const deletions = [...freedImages].filter((path) => path && data.newFiles.has(path) && (!inUse.has(path) || fileOnly.has(path)));
+      const files = [{ path: 'data/catalogue.json', text: catalogueText(catalogue) }];
+      if (provenance) files.push({ path: PROVENANCE, text: `${JSON.stringify(provenance, null, 2)}\n` });
+      await commitToBranch(pr.head.ref, pr.head.sha, {
+        files,
+        deletions,
+        message: `Drop ${plural(count, 'change')} (Remote Admin)\n\n${lines.map((line) => `- ${line}`).join('\n')}`,
+      });
+    }
+    await gh(repoPath(`/issues/${pr.number}/comments`), { method: 'POST', body: { body: note } }).catch(() => null);
+  } catch (error) {
+    return toast(`Couldn’t drop them: ${error.message}`, true);
+  }
+  if (remember) {
+    try {
+      await writeSkipList((list) => {
+        list[tool.id] = [...(Array.isArray(list[tool.id]) ? list[tool.id] : []), ...dropped.flatMap(skipEntries)];
+      }, `Skip list: ${count} from ${tool.name} (Remote Admin)`);
+    } catch (error) {
+      toast(`Dropped, but couldn’t save the skip list (${error.message}), so ${tool.name} may propose ${count === 1 ? 'it' : 'them'} again.`, true);
+      return showTab('review');
+    }
+  }
+  toast(closeInstead ? `Closed #${pr.number}.` : `Dropped ${plural(count, 'change')}. The Guard is checking #${pr.number} again; merge when it says Ready.`);
+  showTab('review');
+}
+
+/** A tool's skip list on its page: what it leaves out, with Allow again. */
+function skippedCard(tool, list) {
+  if (!list.length) return null;
+  const describe = (item) => {
+    if (item.from) return `${item.name}: real id ${item.to}`;
+    if (!item.field) return `${item.name} (new amiibo, ${item.amiiboSeries})`;
+    if (item.value === null || item.value === undefined) return `${item.name} (any value)`;
+    return `${item.name} = ${/^release\./.test(item.field) ? appDate(item.value) : item.value}`;
+  };
+  return h('div', { class: 'card stack' },
+    details(`Skipped by you (${list.length})`,
+      h('p', { class: 'small muted' }, `You dropped these from ${tool.name}’s pull requests, so it leaves them out. Allow one again and the next run can propose it.`),
+      h('ul', { class: 'list' }, list.map((item) =>
+        h('li', { class: 'row spread' },
+          h('div', {}, h('div', {}, describe(item)), h('div', { class: 'small muted' }, `Dropped ${when(item.at)}${item.by ? ` by ${item.by}` : ''}`)),
+          h('button', {
+            type: 'button',
+            class: 'ghost small',
+            onclick: async () => {
+              try {
+                await writeSkipList((data) => {
+                  const same = JSON.stringify(item);
+                  data[tool.id] = (Array.isArray(data[tool.id]) ? data[tool.id] : []).filter((entry) => JSON.stringify(entry) !== same);
+                }, `Skip list: allow ${item.name} again (Remote Admin)`);
+                toast(`${tool.name} can propose ${item.name} again.`);
+                showTab(`tools/${tool.id}`);
+              } catch (error) {
+                toast(`Couldn’t change the skip list: ${error.message}`, true);
+              }
+            },
+          }, 'Allow again'))))));
 }
 
 // ─── App preview ────────────────────────────────────────────────────
@@ -1109,7 +1714,7 @@ function explainSnm(report) {
   if (guessed) {
     const order = [...GUESS_KINDS.map(([, kind]) => kind), 'other'];
     const kinds = [...counts].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0])).map(([kind, n]) => `${kind} ${n}`);
-    check.push(`${guessed === added.length ? 'All of them have' : `${guessed} of them have`} guessed details (${kinds.join(', ')}). They’re marked “Check” in the list; wrong ones are easy to fix in Catalogue after merging.`);
+    check.push(`${guessed === added.length ? 'All of them have' : `${guessed} of them have`} guessed details (${kinds.join(', ')}). They’re marked in orange in the list; untick any you don’t want, or fix them in Catalogue after merging.`);
   }
   if (characters) info.push(`Characters were taken from the names (${characters === added.length ? 'all' : characters}); fine for most, fix any odd one in Catalogue.`);
   const placeholder = added.filter((item) => item.image === 'placeholder').length;
@@ -1118,6 +1723,7 @@ function explainSnm(report) {
   if (byHand) check.push(`${plural(byHand, 'amiibo looks', 'amiibo look')} new, but no source gave a series, so ${byHand === 1 ? 'it wasn’t' : 'they weren’t'} added. Add ${byHand === 1 ? 'it' : 'them'} in Catalogue if real (see “Not added”).`);
   if (sections.ambiguous?.length) check.push(`${plural(sections.ambiguous.length, 'name matches', 'names match')} more than one amiibo we have, so the tool couldn’t tell if ${sections.ambiguous.length === 1 ? 'it’s' : 'they’re'} new (see “Same name as more than one”).`);
 
+  if (sections.skipped?.length) info.push(`${plural(sections.skipped.length, 'item')} you dropped before left out (see “Skipped by you”).`);
   if (sections.unmatched?.length) info.push(`${plural(sections.unmatched.length, 'listing')} from the sources weren’t added; almost all are amiibo we already have (see “Not added”).`);
   return { found: found.length > 0, headline: found.length ? `Found ${joinAnd(found)}.` : 'No new amiibo found.', check, info };
 }
@@ -1144,6 +1750,7 @@ function explainDbUpdate(report) {
   else if (why.length) info.push(`${joinAnd(why)}.`);
   if (sections.disagreements?.length) info.push(`${plural(sections.disagreements.length, 'value')} where a source disagrees with ours: left as they are (see “A source disagrees”).`);
   if (sections.kept?.length) info.push(`${plural(sections.kept.length, 'edit')} you made by hand kept.`);
+  if (sections.skipped?.length) info.push(`${plural(sections.skipped.length, 'change')} you dropped before left out (see “Skipped by you”).`);
   if (sections.notMatched?.length) info.push(`${plural(sections.notMatched.length, 'same-name amiibo', 'same-name amiibo')} from another series ignored.`);
 
   const check = [];
@@ -1197,7 +1804,7 @@ function runSummary(tool, report, ctx = {}) {
     ...explained.check,
   ];
   if (check.length) {
-    box.append(h('div', { class: 'check' },
+    box.append(h('div', { class: 'to-check' },
       h('strong', {}, ctx.review ? 'Check before merging' : 'Worth checking'),
       h('ul', {}, check.map((line) => h('li', {}, line)))));
   }
@@ -1298,6 +1905,7 @@ const FIELD_LABELS = {
   series: 'amiibo series',
   type: 'Type',
   name: 'Name',
+  source: 'Data source',
 };
 const fieldLabel = (field) => FIELD_LABELS[field] || field;
 
@@ -1306,7 +1914,7 @@ function fieldValue(field, value) {
   if (field === 'image') {
     if (value === 'placeholder') return 'our icon (no picture)';
     if (value === 'missing') return h('span', { class: 'muted' }, 'none');
-    return /^https:/.test(value) ? link('new picture', value) : 'new picture';
+    return /^https:/.test(value) ? link('new picture', value) : 'picture';
   }
   if (/^release\./.test(field) && /^\d{4}-\d\d-\d\d$/.test(value)) return appDate(value);
   return String(value);
@@ -1390,6 +1998,13 @@ function addedList(items, prBranch) {
 function sectionBody(key, items) {
   const first = items[0];
   const text = (...parts) => parts.filter(Boolean).join(' ').toLowerCase();
+  if (key === 'skipped') {
+    return bigTable(['amiibo', 'Left out'], items.map((item) => ({
+      text: text(item.name, item.amiiboSeries, item.id),
+      cells: [item.id ? amiiboCell(item) : [h('strong', {}, item.name), item.amiiboSeries ? h('div', { class: 'small muted' }, item.amiiboSeries) : null],
+        item.what || (item.value ? [fieldLabel(item.field), ': ', fieldValue(item.field, item.value)] : `${fieldLabel(item.field)} (any value)`)],
+    })));
+  }
   if (first.field && 'from' in first && 'to' in first) {
     return bigTable(['amiibo', 'What', 'Was', 'Now', 'Why'], items.map((item) => ({
       text: text(item.name, item.id, fieldLabel(item.field)),
@@ -1449,10 +2064,11 @@ function guardBlock(report) {
 }
 
 /** Each list in the report with what it means, then errors, the Guard and the run log. */
-function reportSections(tool, report, prBranch) {
+function reportSections(tool, report, prBranch, { omit = [] } = {}) {
   const wrap = h('div', { class: 'stack' });
   const sections = report.sections || {};
-  const order = [...Object.keys(tool.sections), ...Object.keys(sections).filter((key) => !(key in tool.sections))];
+  const order = [...Object.keys(tool.sections), ...Object.keys(sections).filter((key) => !(key in tool.sections))]
+    .filter((key) => !omit.includes(key));
   for (const key of order) {
     const items = sections[key] || [];
     if (!items.length) continue;
