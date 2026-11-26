@@ -15,8 +15,11 @@ const PLACEHOLDER_IMAGE = 'images/placeholder.webp';
 
 /**
  * The tools this dashboard runs. `reports: true` tools save a report per run under
- * <id>/ on the tool-reports branch; `branch` is the pull request branch they open;
- * `sections` names the lists in their report, in display order.
+ * <id>/ on the tool-reports branch; `branch` is the pull request branch they open.
+ * `sections`: the lists in their report, in display order, each with a title, a plain
+ * explanation (`help`), `fold: true` for lists that are only for information, and `key`
+ * (for the `main` list) to compare a run with the one before it. `brief(counts)` is the
+ * one-line result for run lists; `explain(report)` gives the headline and what to check.
  */
 const TOOLS = [
   {
@@ -29,8 +32,19 @@ const TOOLS = [
     branch: 'snm/update',
     schedule: 'Runs Tuesdays',
     options: [{ key: 'nintendo', label: 'Nintendo sites', values: ['auto', 'always', 'never'], help: 'auto = only when the databases aren’t enough' }],
-    sections: { added: 'New amiibo', promoted: 'Temporary ids replaced', ambiguous: 'Same name as more than one (not added)', unmatched: 'Not added', filled: 'Filled', conflicts: 'Sources disagree (not applied)' },
-    summary: (counts) => `${counts.added ?? 0} new`,
+    main: 'added',
+    sections: {
+      added: { title: 'New amiibo', help: 'Not in the catalogue yet. Merging the pull request adds them.', key: (item) => `${item.name}|${item.amiiboSeries}` },
+      promoted: { title: 'Real ids found', help: 'AmiiboAPI now has the real id of an amiibo we added with a temporary one. Merging switches to the real id; the app moves copies and wishlist entries over by itself.' },
+      ambiguous: { title: 'Same name as more than one (not added)', help: 'The name matches several amiibo we have, so the tool can’t tell whether it’s new. If one is really missing, add it in Catalogue.', fold: true },
+      unmatched: { title: 'Not added', help: 'A source lists these, but they weren’t added. Almost all are older amiibo we already have under a slightly different name: nothing to do. Act only on lines that say “add by hand”, or if one is really missing.', fold: true },
+      filled: { title: 'Filled', help: 'Empty fields on amiibo we already have, filled from a source.' },
+      conflicts: { title: 'Sources disagree (not applied)', help: 'The sources gave different values, so nothing was changed.', fold: true },
+    },
+    brief: (counts) => (counts.added || counts.promoted
+      ? [counts.added ? `${counts.added} new amiibo` : '', counts.promoted ? `${counts.promoted} real id${counts.promoted === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ')
+      : 'No new amiibo'),
+    explain: explainSnm,
   },
   {
     id: 'db-update',
@@ -42,8 +56,15 @@ const TOOLS = [
     branch: 'db-update/update',
     schedule: 'Runs when you start it',
     options: [],
-    sections: { changes: 'Changes', disagreements: 'One source disagrees (not changed)', kept: 'Your edits kept', notMatched: 'Same name, different series (not used)' },
-    summary: (counts) => `${counts.changes ?? 0} changes`,
+    main: 'changes',
+    sections: {
+      changes: { title: 'Changes', help: 'What merging changes. Each one fills an empty field or picture, replaces a value a tool guessed, or corrects a release date AmiiboAPI and amiibo life agree on.', key: (item) => `${item.id}|${item.field}|${item.to}` },
+      disagreements: { title: 'A source disagrees (not changed)', help: 'Ours stays as it is. Usually ours is right (sources mix up re-releases and bundles). If the source is right, fix it with Edit; the tools never overwrite your edits.', fold: true },
+      kept: { title: 'Your edits kept', help: 'You set these by hand, so the tool left them alone even though a source says otherwise.', fold: true },
+      notMatched: { title: 'Same name, different series (not used)', help: 'A source has an amiibo with the same name as one of ours but in another series, so it was ignored (for example Monster Hunter’s Rudy and Animal Crossing’s Rudy).', fold: true },
+    },
+    brief: (counts) => (counts.changes ? `${counts.changes} change${counts.changes === 1 ? '' : 's'}` : 'Nothing to change'),
+    explain: explainDbUpdate,
   },
   {
     id: 'weekly',
@@ -92,7 +113,7 @@ function h(tag, attrs = {}, ...children) {
       if (/^(https:|blob:|data:image\/)/.test(String(value))) el.setAttribute(key, value);
     } else el.setAttribute(key, value === true ? '' : value);
   }
-  for (const child of children.flat()) {
+  for (const child of children.flat(Infinity)) {
     if (child === null || child === undefined || child === false) continue;
     el.append(child instanceof Node ? child : document.createTextNode(String(child)));
   }
@@ -318,18 +339,12 @@ function amiiboImage(entry, className = 'thumb') {
   return img;
 }
 
-/** An image straight from the repo at a ref (for amiibo not published yet). */
-async function repoImage(path, ref, alt) {
+/** An image straight from the repo at a ref (for amiibo not published yet); loads in the background. */
+function repoImage(path, ref, alt) {
   const img = h('img', { class: 'thumb', alt });
-  try {
-    const blob = await gh(repoPath(`/contents/${path}?ref=${encodeURIComponent(ref)}`), {
-      accept: 'application/vnd.github.raw+json',
-      as: 'blob',
-    });
-    img.src = URL.createObjectURL(blob);
-  } catch {
-    img.alt = 'no image';
-  }
+  gh(repoPath(`/contents/${path}?ref=${encodeURIComponent(ref)}`), { accept: 'application/vnd.github.raw+json', as: 'blob' })
+    .then((blob) => { img.src = URL.createObjectURL(blob); })
+    .catch(() => { img.alt = ''; img.title = 'No picture yet'; });
   return img;
 }
 
@@ -447,8 +462,48 @@ const stat = (label, value, note) =>
 
 function runPill(run) {
   if (!run) return pill('never run');
-  const result = run.conclusion || run.status;
-  return pill(result, result === 'success' ? 'ok' : result === 'failure' ? 'error' : 'warn');
+  if (run.status !== 'completed') return pill(['queued', 'waiting', 'pending', 'requested'].includes(run.status) ? 'waiting' : 'running', 'warn');
+  const words = { success: 'succeeded', failure: 'failed', cancelled: 'cancelled', skipped: 'skipped', timed_out: 'timed out', action_required: 'needs approval' };
+  return pill(words[run.conclusion] || run.conclusion, run.conclusion === 'success' ? 'ok' : ['failure', 'timed_out'].includes(run.conclusion) ? 'error' : 'warn');
+}
+
+/** "dry run" or "pull request run": from the report, else from the run's title (see run-name in the workflows). */
+function runKind(run, report) {
+  if (report) return report.dryRun ? 'dry run' : 'pull request run';
+  const title = run?.display_title || '';
+  if (/dry run/i.test(title)) return 'dry run';
+  if (/pull request run|weekly/i.test(title)) return 'pull request run';
+  return 'run';
+}
+
+/** A run's name for lists: tool runs say which kind ("SNM dry run"); others use the workflow name. */
+function runLabel(run) {
+  const title = run.display_title || '';
+  return title.startsWith(run.name) && title.length < 60 ? title : run.name;
+}
+
+function reportCounts(report) {
+  return Object.fromEntries(Object.entries(report.sections || {}).map(([key, list]) => [key, list.length]));
+}
+
+function guardPill(outcome) {
+  if (!outcome) return pill('Guard: no result', 'warn');
+  if (outcome === 'success') return pill('Guard passed', 'ok');
+  if (outcome === 'failure') return pill('Guard blocked', 'error');
+  return pill(`Guard ${outcome === 'skipped' ? 'didn’t run' : outcome}`, 'warn');
+}
+
+const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+
+/** "a, b and c". */
+function joinAnd(parts) {
+  return parts.length <= 1 ? parts.join('') : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/** Up to `max` names, then "and N more". */
+function someNames(names, max = 5) {
+  const unique = [...new Set(names)];
+  return unique.length <= max ? joinAnd(unique) : `${unique.slice(0, max).join(', ')} and ${unique.length - max} more`;
 }
 
 /** Latest GitHub run of each tool's workflow. */
@@ -480,14 +535,17 @@ async function showHome() {
   const toolCard = (tool) => {
     const run = tool.workflow ? byFile.get(tool.workflow) : null;
     const report = latestById[tool.id];
-    const counts = report ? Object.fromEntries(Object.entries(report.sections || {}).map(([key, list]) => [key, list.length])) : {};
     const waiting = tool.branch ? pulls.find((pr) => pr.head.ref === tool.branch) : null;
+    const running = run && run.status !== 'completed';
+    const lastLine = running
+      ? `Running now (${runKind(run, null)}, started ${when(run.run_started_at || run.created_at)})`
+      : report
+        ? `Last run, ${report.dryRun ? 'dry run' : 'pull request run'} (${when(report.startedAt)}): ${tool.brief(reportCounts(report))}${report.guard?.outcome && report.guard.outcome !== 'success' ? ' · Guard blocked it' : ''}`
+        : run ? `Last run ${when(run.created_at)}` : 'Not run yet';
     return h('div', { class: `card tool${tool.planned ? ' planned' : ''}` },
       h('div', { class: 'row spread' }, h('h2', {}, tool.title), tool.planned ? pill('planned') : runPill(run)),
       h('p', { class: 'small muted' }, tool.description),
-      tool.planned ? null : h('p', { class: 'small' },
-        report ? `Last report: ${tool.summary(counts)} · ${when(report.startedAt)}${report.dryRun ? ' · dry run' : ''}` : run ? `Last run ${when(run.created_at)}` : 'Not run yet',
-        tool.schedule ? ` · ${tool.schedule}` : ''),
+      tool.planned ? null : h('p', { class: 'small' }, lastLine, tool.schedule ? ` · ${tool.schedule}` : ''),
       waiting ? h('p', { class: 'small warn' }, `Pull request #${waiting.number} is waiting for review`) : null,
       tool.planned ? null : h('div', { class: 'row' },
         tool.reports
@@ -518,22 +576,31 @@ function runsTable(runs) {
   return h('div', { class: 'table-wrap' }, h('table', {},
     h('thead', {}, h('tr', {}, h('th', {}, 'Workflow'), h('th', {}, 'Result'), h('th', {}, 'Started'), h('th', {}, ''))),
     h('tbody', {}, runs.map((run) =>
-      h('tr', {}, h('td', {}, run.name), h('td', {}, runPill(run)), h('td', { class: 'small muted' }, when(run.created_at)), h('td', {}, link('Log', run.html_url)))))));
+      h('tr', {}, h('td', {}, runLabel(run)), h('td', {}, runPill(run)), h('td', { class: 'small muted' }, when(run.created_at)), h('td', {}, link('Log', run.html_url)))))));
 }
 
 /** Starts a tool's workflow. Report tools ask dry run vs pull request; options as chosen. */
 async function runTool(tool, dryRun, options = {}) {
   const body = tool.reports
     ? dryRun
-      ? 'It reads the sources and saves a report. Nothing in the data changes.'
-      : 'If it finds anything, it opens or updates its pull request. Nothing changes until you merge it.'
+      ? 'It reads the sources and saves a report of what it would do. Nothing in the data changes and no pull request is opened.'
+      : 'If it finds anything, it opens (or updates) its pull request for you to review. Nothing changes until you merge it.'
     : 'It runs on GitHub with its usual checks.';
   const title = tool.reports ? `${tool.name}: ${dryRun ? 'dry run' : 'run and open a pull request'}?` : `Run ${tool.name}?`;
   if (!(await confirmDialog(title, body, 'Run'))) return;
   const inputs = tool.reports ? { dry_run: dryRun ? 'true' : 'false', ...options } : {};
   try {
+    // The newest run before this one: run ids only go up, so a higher one is the new run.
+    const before = tool.reports ? await gh(repoPath(`/actions/workflows/${tool.workflow}/runs?per_page=1`)).catch(() => null) : null;
     await dispatch(tool.workflow, inputs);
-    toast(`${tool.name} started.${tool.reports ? ' Its report appears under Tools when it finishes.' : ''}`);
+    if (tool.reports) {
+      // Its page shows the run as it starts, follows it and shows the result when it's done.
+      state.started = { toolId: tool.id, at: Date.now(), afterId: before?.workflow_runs?.[0]?.id ?? 0, kind: dryRun ? 'dry run' : 'pull request run' };
+      toast(`${tool.name} started. This page follows it and shows the result when it’s done.`);
+      showTab(`tools/${tool.id}`);
+    } else {
+      toast(`${tool.name} started.`);
+    }
   } catch (error) {
     toast(`Couldn’t start ${tool.name}: ${error.message}`, true);
   }
@@ -553,20 +620,13 @@ async function showTools(toolId, kind, runId) {
   const tool = toolById(toolId);
   if (!tool || !tool.reports) return showTab('tools');
   if (kind === 'run' && runId) return showRun(tool, runId);
-  loading();
-  const [index, runs] = await Promise.all([
-    fileJson(`${tool.id}/index.json`, REPORTS_BRANCH).catch(() => null),
-    gh(repoPath(`/actions/workflows/${tool.workflow}/runs?per_page=5`)).catch(() => ({ workflow_runs: [] })),
-  ]);
-  const list = index || [];
   const selects = {};
   const optionControls = (tool.options || []).map((option) => {
     selects[option.key] = h('select', {}, option.values.map((value) => h('option', { value }, value)));
     return h('label', {}, `${option.label} (${option.help})`, selects[option.key]);
   });
   const chosen = () => Object.fromEntries(Object.entries(selects).map(([key, select]) => [key, select.value]));
-  const sectionKeys = Object.keys(tool.sections);
-  const usedKeys = sectionKeys.filter((key) => list.some((run) => (run.counts?.[key] ?? 0) > 0) || ['added', 'changes'].includes(key));
+  const live = h('div', {}, h('p', { class: 'muted' }, 'Loading…'));
   view(
     h('div', { class: 'card stack' },
       h('div', { class: 'row spread' }, h('h2', {}, tool.title), h('button', { type: 'button', class: 'ghost', onclick: () => showTab('tools') }, 'All tools')),
@@ -574,23 +634,133 @@ async function showTools(toolId, kind, runId) {
       optionControls.length ? h('div', { class: 'fields' }, optionControls) : null,
       h('div', { class: 'row' },
         h('button', { type: 'button', onclick: () => runTool(tool, true, chosen()) }, 'Dry run'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => runTool(tool, false, chosen()) }, 'Run and open PR'),
-        list.length ? h('button', { type: 'button', class: 'ghost', onclick: () => exportRuns(tool, list) }, 'Export recent runs') : null)),
-    runs.workflow_runs.length ? h('div', { class: 'card' }, h('h2', {}, 'On GitHub'), runsTable(runs.workflow_runs)) : null,
-    h('div', { class: 'card table-wrap' },
-      h('h2', {}, 'Reports'),
-      list.length === 0
-        ? h('p', { class: 'muted' }, 'No runs yet.')
-        : h('table', {},
-            h('thead', {}, h('tr', {}, h('th', {}, 'Started'), h('th', {}, 'Kind'), ...usedKeys.map((key) => h('th', {}, tool.sections[key])), h('th', {}, 'Errors'), h('th', {}, 'Guard'))),
-            h('tbody', {}, list.map((run) =>
-              h('tr', { class: 'clickable', onclick: () => showTab(`tools/${tool.id}/run/${run.runId}`) },
-                h('td', {}, when(run.startedAt)),
-                h('td', {}, run.dryRun ? pill('dry run') : pill('PR', 'ok')),
-                ...usedKeys.map((key) => h('td', {}, String(run.counts?.[key] ?? 0))),
-                h('td', {}, run.errors ? pill(String(run.errors), 'warn') : '0'),
-                h('td', {}, pill(run.guard, run.guard === 'success' ? 'ok' : 'error'))))))),
+        h('button', { type: 'button', class: 'ghost', onclick: () => runTool(tool, false, chosen()) }, 'Run and open PR')),
+      h('p', { class: 'small muted' }, 'Dry run: shows what it would do; nothing changes. Run and open PR: the same search, then a pull request you look over and merge in Review.')),
+    live,
   );
+  await refreshToolLive(tool, live, currentHash);
+}
+
+/**
+ * The changing part of a tool's page: its pull request, latest result and runs. While a
+ * run is starting or running it refreshes itself every few seconds (only this part, so
+ * the options above keep their values) and says when the run is done.
+ */
+async function refreshToolLive(tool, live, hash) {
+  clearTimeout(state.pollTimer);
+  const [index, runs, latest, pulls] = await Promise.all([
+    fileJson(`${tool.id}/index.json`, REPORTS_BRANCH).catch(() => null),
+    gh(repoPath(`/actions/workflows/${tool.workflow}/runs?per_page=15`)).catch(() => ({ workflow_runs: [] })),
+    fileJson(`${tool.id}/latest.json`, REPORTS_BRANCH).catch(() => null),
+    gh(repoPath('/pulls?state=open&per_page=30')).catch(() => []),
+  ]);
+  if (currentHash !== hash || !live.isConnected) return;
+  const list = index || [];
+  const rows = mergeRuns(list, runs.workflow_runs);
+  const started = state.started?.toolId === tool.id && Date.now() - state.started.at < 120000 ? state.started : null;
+  if (started && rows.some((row) => row.run && row.run.id > started.afterId)) state.started = null;
+  else if (started) rows.unshift({ id: 'starting', startedAt: new Date(started.at).toISOString(), kind: started.kind, active: true, starting: true });
+
+  // Say so when a run this page was following has finished.
+  const watched = state.watching?.toolId === tool.id ? state.watching.ids : new Set();
+  for (const row of rows) {
+    if (!watched.has(row.id) || row.active) continue;
+    const failed = row.run && row.run.conclusion !== 'success';
+    toast(`${tool.name} ${row.kind} finished: ${row.report ? tool.brief(row.report.counts || {}) : failed ? 'it failed, see the log' : 'done'}.`, failed);
+  }
+  state.watching = { toolId: tool.id, ids: new Set(rows.filter((row) => row.active).map((row) => row.id)) };
+
+  const waiting = pulls.find((pr) => pr.head.ref === tool.branch);
+  const latestRun = latest ? runs.workflow_runs.find((run) => String(run.id) === String(latest.runId)) : null;
+  live.replaceChildren(...[
+    waiting
+      ? h('div', { class: 'banner is-warn row spread' },
+          h('span', {}, h('strong', {}, `Pull request #${waiting.number} is waiting for your review.`), ' Look it over, then merge or close it.'),
+          h('button', { type: 'button', onclick: () => showTab('review') }, 'Review it'))
+      : null,
+    latest
+      ? h('div', { class: 'card stack' },
+          h('div', { class: 'row spread' },
+            h('h2', {}, 'Latest result'),
+            h('button', { type: 'button', class: 'ghost', onclick: () => showTab(`tools/${tool.id}/run/${latest.runId}`) }, 'Full report')),
+          runSummary(tool, latest, { run: latestRun, pr: !latest.dryRun ? waiting : null, compact: true }))
+      : null,
+    h('div', { class: 'card stack' },
+      h('div', { class: 'row spread' },
+        h('h2', {}, 'Runs'),
+        list.length ? h('button', { type: 'button', class: 'ghost', onclick: () => exportRuns(tool, list) }, 'Export recent runs') : null),
+      h('p', { class: 'small muted' }, 'Tap a run for its full report.'),
+      runList(tool, rows)),
+  ].filter(Boolean));
+
+  if (rows.some((row) => row.active)) {
+    const poll = () => {
+      if (currentHash !== hash || !live.isConnected || !state.token) return;
+      if (document.hidden) {
+        state.pollTimer = setTimeout(poll, 10000);
+        return;
+      }
+      refreshToolLive(tool, live, hash).catch(() => (state.pollTimer = setTimeout(poll, 20000)));
+    };
+    state.pollTimer = setTimeout(poll, started ? 5000 : 10000);
+  }
+}
+
+/** GitHub runs and saved reports, joined by run id, newest first. */
+function mergeRuns(index, runs) {
+  const rows = new Map();
+  for (const entry of index) {
+    rows.set(String(entry.runId), { id: String(entry.runId), startedAt: entry.startedAt, report: entry, kind: entry.dryRun ? 'dry run' : 'pull request run', active: false });
+  }
+  for (const run of runs) {
+    const id = String(run.id);
+    const row = rows.get(id) || { id, startedAt: run.run_started_at || run.created_at, report: null };
+    row.run = run;
+    row.kind = row.report ? row.kind : runKind(run, null);
+    row.active = run.status !== 'completed';
+    rows.set(id, row);
+  }
+  return [...rows.values()].sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt)).slice(0, 20);
+}
+
+function minutesSince(iso) {
+  const minutes = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  return minutes < 1 ? 'under a minute' : plural(minutes, 'minute');
+}
+
+/** A link that doesn't also trigger the clickable row it sits in. */
+function rowLink(text, href) {
+  return h('a', { href, target: '_blank', rel: 'noopener noreferrer', onclick: (event) => event.stopPropagation() }, text);
+}
+
+function runList(tool, rows) {
+  if (!rows.length) return h('p', { class: 'muted' }, 'No runs yet. Start with a dry run.');
+  const result = (row) => {
+    const report = row.report;
+    if (row.starting) return [pill('starting', 'warn'), ' Waiting for GitHub to start it…'];
+    if (row.active && !report) {
+      return ['queued', 'waiting', 'pending', 'requested'].includes(row.run.status)
+        ? [pill('waiting', 'warn'), ' Starts when the other tool run is done']
+        : [pill('running', 'warn'), ` for ${minutesSince(row.run.run_started_at || row.run.created_at)}`];
+    }
+    if (report) {
+      return [tool.brief(report.counts || {}),
+        report.errors ? [' ', pill(plural(report.errors, 'error'), 'warn')] : null,
+        row.active ? [' ', pill('finishing', 'warn')] : row.run && row.run.conclusion !== 'success' ? [' ', pill('run failed', 'error')] : null];
+    }
+    if (row.run?.conclusion === 'cancelled') return pill('cancelled', 'warn');
+    if (row.run && row.run.conclusion !== 'success') return [pill('failed', 'error'), ' No report: it stopped before finishing. The log says why.'];
+    return h('span', { class: 'muted' }, 'No report');
+  };
+  return h('div', { class: 'table-wrap' }, h('table', {},
+    h('thead', {}, h('tr', {}, ...['Started', 'Kind', 'Result', 'Guard', ''].map((title) => h('th', {}, title)))),
+    h('tbody', {}, rows.map((row) =>
+      h('tr', { class: row.report ? 'clickable' : '', onclick: row.report ? () => showTab(`tools/${tool.id}/run/${row.id}`) : null },
+        h('td', { class: 'small' }, when(row.startedAt)),
+        h('td', {}, row.kind === 'dry run' ? pill('dry run') : row.kind === 'pull request run' ? pill('PR', 'ok') : pill(row.kind)),
+        h('td', {}, result(row)),
+        h('td', {}, row.report ? guardPill(row.report.guard) : ''),
+        h('td', {}, row.run ? rowLink('Log', row.run.html_url) : row.report?.runUrl ? rowLink('Log', row.report.runUrl) : ''))))));
 }
 
 // ─── Review (open pull requests) ───────────────────────────────────
@@ -608,35 +778,38 @@ async function showReview() {
 
 async function reviewCard(pr) {
   const card = h('div', { class: 'card stack' });
-  const checks = await gh(repoPath(`/commits/${pr.head.sha}/check-runs`)).catch(() => ({ check_runs: [] }));
+  const tool = toolForBranch(pr.head.ref);
+  const runId = tool?.reports ? (pr.body || '').match(/\brun (\d+|local-\d+)/)?.[1] : null;
+  const [checks, guardRun, files, report] = await Promise.all([
+    gh(repoPath(`/commits/${pr.head.sha}/check-runs`)).catch(() => ({ check_runs: [] })),
+    latestGuardRun(pr.head.sha).catch(() => null),
+    gh(repoPath(`/pulls/${pr.number}/files?per_page=100`)),
+    runId ? fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH).catch(() => null) : null,
+  ]);
+  const guardOutcome = report?.guard?.outcome ?? null;
+  const guard = guardState({ tool, toolOutcome: guardOutcome, guardRun, files });
+  const failing = checks.check_runs.filter((run) => run.conclusion === 'failure' && !/guard/i.test(run.name));
+  const status = mergeStatus(guard, failing);
   const checkPills = checks.check_runs.map((run) =>
     pill(`${run.name}: ${run.conclusion || run.status}`, run.conclusion === 'success' ? 'ok' : run.conclusion === 'failure' ? 'error' : 'warn'));
-  const guardRun = await latestGuardRun(pr.head.sha).catch(() => null);
-  if (guardRun && !checks.check_runs.some((run) => /guard/i.test(run.name))) {
-    const result = guardRun.status === 'completed' ? guardRun.conclusion : guardRun.status;
-    checkPills.unshift(pill(`Guard: ${result}`, result === 'success' ? 'ok' : result === 'failure' ? 'error' : 'warn'));
-  }
-  const tool = toolForBranch(pr.head.ref);
+
   card.append(
     h('div', { class: 'row spread' },
       h('h2', {}, `#${pr.number} ${pr.title}`),
       link('Open on GitHub', pr.html_url)),
     h('div', { class: 'row small muted' },
-      `${pr.head.ref} · ${when(pr.updated_at)}`,
+      `${tool ? `Opened by ${tool.name}` : 'Your change'} · updated ${when(pr.updated_at)}`,
       ...pr.labels.map((label) => pill(label.name)),
       ...checkPills),
+    h('div', { class: `banner is-${status.kind}` }, h('strong', {}, status.title), ' ', status.text),
   );
-  let guardOutcome = null;
-  if (tool?.reports) {
-    const runId = (pr.body || '').match(/\brun (\d+|local-\d+)/)?.[1];
-    const report = runId ? await fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH).catch(() => null) : null;
-    guardOutcome = report?.guard?.outcome ?? null;
-    if (report) card.append(await reportDetails(tool, report, pr.head.ref));
-    else card.append(h('pre', {}, pr.body || ''));
+  if (tool?.reports && report) {
+    card.append(h('h3', {}, 'What merging does'), runSummary(tool, report, { review: true }), reportSections(tool, report, pr.head.ref));
+  } else if (tool?.reports) {
+    card.append(h('p', { class: 'warn' }, 'Couldn’t find the report for this run. Its description from GitHub:'), h('pre', {}, pr.body || ''));
   } else {
-    card.append(h('pre', {}, pr.body || '(no description)'));
+    card.append(h('h3', {}, 'What merging does'), h('pre', {}, pr.body || '(no description)'));
   }
-  const files = await gh(repoPath(`/pulls/${pr.number}/files?per_page=100`));
   if (files.some((file) => file.filename === 'data/catalogue.json')) {
     const holder = h('div');
     const button = h('button', {
@@ -655,14 +828,14 @@ async function reviewCard(pr) {
         }
       },
     }, 'Preview in the app');
-    card.append(h('h3', {}, 'Preview'), button, holder);
+    card.append(h('h3', {}, 'Preview'), h('p', { class: 'small muted' }, 'See the new and changed amiibo the way the app shows them.'), button, holder);
   }
   card.append(
-    h('h3', {}, `Files (${files.length})`),
-    h('ul', { class: 'list small' }, files.slice(0, 30).map((file) =>
-      h('li', {}, `${file.status} ${file.filename} (+${file.additions} −${file.deletions})`))),
+    details(`Files changed (${files.length})`,
+      h('ul', { class: 'list small' }, files.slice(0, 30).map((file) =>
+        h('li', {}, `${file.status} ${file.filename} (+${file.additions} −${file.deletions})`)))),
     h('div', { class: 'row' },
-      h('button', { type: 'button', onclick: () => mergePr(pr, files, guardOutcome) }, 'Merge'),
+      h('button', { type: 'button', disabled: guard === 'failed' || guard === 'no report', onclick: () => mergePr(pr, files, guardOutcome) }, 'Merge'),
       h('button', { type: 'button', class: 'ghost', onclick: () => closePr(pr) }, 'Close without merging')),
   );
   return card;
@@ -682,6 +855,39 @@ async function latestGuardRun(sha) {
 }
 
 /**
+ * The Guard's verdict on a pull request: passed, failed, running, not started, no report
+ * (a tool's report is missing) or not needed (no data files). Fails closed: a data pull
+ * request counts as passed only with a passing result.
+ */
+function guardState({ tool, toolOutcome, guardRun, files }) {
+  // 100 = the most the files list returns, so there may be data files beyond it.
+  const touchesData = files.length >= 100 || files.some((file) => GUARDED_PATH.test(file.filename));
+  // The tools open their pull requests as GitHub Actions, which doesn't start the Guard
+  // workflow, so they run the Guard themselves and their report has the result.
+  const results = [];
+  if (tool?.reports) results.push(toolOutcome || 'no report');
+  if (guardRun) results.push(guardRun.status === 'completed' ? guardRun.conclusion : 'running');
+  if (touchesData && results.length === 0) results.push('not started');
+  if (results.includes('no report')) return 'no report';
+  if (results.some((result) => !['success', 'running', 'not started'].includes(result))) return 'failed';
+  if (results.includes('running')) return 'running';
+  if (results.includes('not started')) return 'not started';
+  return results.length ? 'passed' : 'not needed';
+}
+
+const AFTER_MERGE = 'Merging puts it on main; Publish checks it and puts it online, and phones get it within about a day (the app checks daily and applies it on the next launch).';
+
+function mergeStatus(guard, failing) {
+  if (guard === 'failed') return { kind: 'error', title: 'Can’t merge here.', text: 'The Guard blocked it: it changes or removes something it isn’t allowed to. See Guard below, or review it on GitHub.' };
+  if (guard === 'no report') return { kind: 'error', title: 'Can’t merge here.', text: 'The report for this run is missing, so the Guard result is unknown. Run the tool again, or review it on GitHub.' };
+  if (guard === 'running' || guard === 'not started') {
+    return { kind: 'warn', title: 'Not ready yet.', text: `The Guard check ${guard === 'running' ? 'is still running' : 'hasn’t started yet'}. Open Review again in a minute.` };
+  }
+  if (failing.length) return { kind: 'warn', title: 'Ready, with a warning.', text: `Failing checks: ${failing.map((run) => run.name).join(', ')}. GitHub may refuse the merge.` };
+  return { kind: 'ok', title: 'Ready to merge.', text: `${guard === 'not needed' ? 'No data files change, so the Guard isn’t needed.' : 'The Guard passed.'} ${AFTER_MERGE}` };
+}
+
+/**
  * Merges only when the Guard has passed. Fails closed: a data pull request with no Guard
  * result yet (the check hasn't started, or a tool's report is missing) isn't merged.
  */
@@ -694,29 +900,19 @@ async function mergePr(pr, files, toolGuardOutcome) {
     return toast(`Couldn’t read the Guard check: ${error.message}`, true);
   }
   const checkRuns = (await gh(repoPath(`/commits/${pr.head.sha}/check-runs?per_page=100`)).catch(() => null))?.check_runs || [];
-  const tool = toolForBranch(pr.head.ref);
-  // 100 = the most the files list returns, so there may be data files beyond it.
-  const touchesData = files.length >= 100 || files.some((file) => GUARDED_PATH.test(file.filename));
-
-  // The tools open their pull requests as GitHub Actions, which doesn't start the Guard
-  // workflow, so they run the Guard themselves and their report has the result.
-  const results = [];
-  if (tool?.reports) results.push(toolGuardOutcome || 'no report');
-  if (guardRun) results.push(guardRun.status === 'completed' ? guardRun.conclusion : 'running');
-  if (touchesData && results.length === 0) results.push('not started');
-
-  if (results.includes('no report')) {
+  const guard = guardState({ tool: toolForBranch(pr.head.ref), toolOutcome: toolGuardOutcome, guardRun, files });
+  if (guard === 'no report') {
     return toast('Couldn’t find the report for this run, so the Guard result is unknown. Review it on GitHub.', true);
   }
-  if (results.some((result) => !['success', 'running', 'not started'].includes(result))) {
+  if (guard === 'failed') {
     return toast('The Guard check failed for this pull request, so the dashboard won’t merge it. Review it on GitHub.', true);
   }
-  if (results.includes('running') || results.includes('not started')) {
-    return toast(`The Guard check ${results.includes('running') ? 'is still running' : 'hasn’t started yet'}. Try again in a minute.`, true);
+  if (guard === 'running' || guard === 'not started') {
+    return toast(`The Guard check ${guard === 'running' ? 'is still running' : 'hasn’t started yet'}. Try again in a minute.`, true);
   }
   const failing = checkRuns.filter((run) => run.conclusion === 'failure');
   const pending = checkRuns.filter((run) => !run.conclusion);
-  const notes = [`Merging publishes the data to the app (Publish runs its checks first).`];
+  const notes = [AFTER_MERGE];
   if (failing.length) notes.push(h('p', { class: 'error' }, `Failing checks: ${failing.map((run) => run.name).join(', ')}. GitHub may refuse the merge.`));
   if (pending.length) notes.push(h('p', { class: 'warn' }, `Still running: ${pending.map((run) => run.name).join(', ')}.`));
   if (!(await confirmDialog(`Merge #${pr.number}?`, notes, 'Merge'))) return;
@@ -829,22 +1025,453 @@ async function appPreview(ref) {
 
 async function showRun(tool, runId) {
   loading();
-  const report = await fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH);
+  const [report, index, run] = await Promise.all([
+    fileJson(`${tool.id}/reports/${runId}.json`, REPORTS_BRANCH),
+    fileJson(`${tool.id}/index.json`, REPORTS_BRANCH).catch(() => null),
+    /^\d+$/.test(runId) ? gh(repoPath(`/actions/runs/${runId}`)).catch(() => null) : null,
+  ]);
   if (!report) throw new Error('Report not found.');
+  // The index is newest first: the run before this one is the next entry.
+  const list = index || [];
+  const position = list.findIndex((entry) => String(entry.runId) === String(runId));
+  const previousEntry = position >= 0 ? list[position + 1] : list.find((entry) => Date.parse(entry.startedAt) < Date.parse(report.startedAt));
+  const [previous, pr] = await Promise.all([
+    previousEntry ? fileJson(`${tool.id}/reports/${previousEntry.runId}.json`, REPORTS_BRANCH).catch(() => null) : null,
+    !report.dryRun && tool.branch ? findRunPr(tool, report).catch(() => null) : null,
+  ]);
   view(
     h('div', { class: 'card stack' },
       h('div', { class: 'row spread' },
-        h('h2', {}, `${tool.name} run · ${when(report.startedAt)}`),
+        h('h2', {}, `${tool.name} · ${report.dryRun ? 'dry run' : 'pull request run'}`),
         h('div', { class: 'row' },
           h('button', { type: 'button', class: 'ghost', onclick: () => showTab(`tools/${tool.id}`) }, `All ${tool.name} runs`),
           report.runUrl ? link('Log on GitHub', report.runUrl) : null)),
+      runSummary(tool, report, { run, pr, previous })),
+    h('div', { class: 'card stack' }, h('h2', {}, 'Details'), reportSections(tool, report, null)),
+    h('div', { class: 'card stack' },
+      h('h2', {}, 'Share this report'),
+      h('p', { class: 'small muted' }, 'To ask about a run, copy it as text and paste it into the chat.'),
       h('div', { class: 'row' },
         h('button', { type: 'button', onclick: () => copyText(reportToText(tool, report)) }, 'Copy as text'),
         h('button', { type: 'button', class: 'ghost', onclick: () => download(`${tool.id}-run-${report.runId}.txt`, reportToText(tool, report), 'text/plain') }, 'Download .txt'),
-        h('button', { type: 'button', class: 'ghost', onclick: () => download(`${tool.id}-run-${report.runId}.json`, JSON.stringify(report, null, 2), 'application/json') }, 'Download .json')),
-      h('p', { class: 'muted small' }, `${report.dryRun ? 'Dry run' : 'Pull request run'} · guard ${report.guard?.outcome || '?'}`),
-      await reportDetails(tool, report, null)),
+        h('button', { type: 'button', class: 'ghost', onclick: () => download(`${tool.id}-run-${report.runId}.json`, JSON.stringify(report, null, 2), 'application/json') }, 'Download .json'))),
   );
+}
+
+/** The pull request a run opened or updated: its body names the run, else the one open at the time. */
+async function findRunPr(tool, report) {
+  const owner = state.repo.split('/')[0];
+  const pulls = await gh(repoPath(`/pulls?state=all&head=${encodeURIComponent(`${owner}:${tool.branch}`)}&per_page=10`));
+  const start = Date.parse(report.startedAt);
+  const end = Date.parse(report.finishedAt || report.startedAt) + 15 * 60000;
+  return pulls.find((pr) => (pr.body || '').includes(`run ${report.runId}`))
+    || pulls.find((pr) => Date.parse(pr.created_at) <= end && (pr.closed_at ? Date.parse(pr.closed_at) : Date.now()) >= start)
+    || null;
+}
+
+// What each kind of guess in an SNM report is about, most important first.
+const GUESS_KINDS = [
+  [/is new to the catalogue/, 'new amiibo series'],
+  [/^amiibo series taken from/, 'amiibo series'],
+  [/^game series/, 'game series'],
+  [/^type assumed/, 'type'],
+  [/^character/, 'character'],
+];
+
+/** A new amiibo's guesses worth a look: a character taken from the name hardly ever is. */
+function importantGuesses(item) {
+  return (item.guessed || []).filter((text) => !/^character /.test(text));
+}
+
+/** SNM: new amiibo, real ids, and what a person should look at. */
+function explainSnm(report) {
+  const sections = report.sections || {};
+  const added = sections.added || [];
+  const promoted = sections.promoted || [];
+  const found = [];
+  if (added.length) found.push(`${added.length} new amiibo`);
+  if (promoted.length) found.push(`the real id of ${plural(promoted.length, 'amiibo', 'amiibo')} we added with a temporary one`);
+
+  const check = [];
+  const info = [];
+  const counts = new Map();
+  let guessed = 0;
+  let characters = 0;
+  for (const item of added) {
+    const important = importantGuesses(item);
+    if (important.length) guessed++;
+    if (important.length < (item.guessed?.length || 0)) characters++;
+    for (const text of important) {
+      const kind = GUESS_KINDS.find(([pattern]) => pattern.test(text))?.[1] || 'other';
+      counts.set(kind, (counts.get(kind) || 0) + 1);
+    }
+  }
+  if (guessed) {
+    const order = [...GUESS_KINDS.map(([, kind]) => kind), 'other'];
+    const kinds = [...counts].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0])).map(([kind, n]) => `${kind} ${n}`);
+    check.push(`${guessed === added.length ? 'All of them have' : `${guessed} of them have`} guessed details (${kinds.join(', ')}). They’re marked “Check” in the list; wrong ones are easy to fix in Catalogue after merging.`);
+  }
+  if (characters) info.push(`Characters were taken from the names (${characters === added.length ? 'all' : characters}); fine for most, fix any odd one in Catalogue.`);
+  const placeholder = added.filter((item) => item.image === 'placeholder').length;
+  if (placeholder) check.push(`${plural(placeholder, 'has', 'have')} no picture yet: the app shows our icon until Update Database finds one.`);
+  const byHand = (sections.unmatched || []).filter((item) => /add by hand/.test(item.reason || '')).length;
+  if (byHand) check.push(`${plural(byHand, 'amiibo looks', 'amiibo look')} new, but no source gave a series, so ${byHand === 1 ? 'it wasn’t' : 'they weren’t'} added. Add ${byHand === 1 ? 'it' : 'them'} in Catalogue if real (see “Not added”).`);
+  if (sections.ambiguous?.length) check.push(`${plural(sections.ambiguous.length, 'name matches', 'names match')} more than one amiibo we have, so the tool couldn’t tell if ${sections.ambiguous.length === 1 ? 'it’s' : 'they’re'} new (see “Same name as more than one”).`);
+
+  if (sections.unmatched?.length) info.push(`${plural(sections.unmatched.length, 'listing')} from the sources weren’t added; almost all are amiibo we already have (see “Not added”).`);
+  return { found: found.length > 0, headline: found.length ? `Found ${joinAnd(found)}.` : 'No new amiibo found.', check, info };
+}
+
+const WHY_TEXT = {
+  'was empty': 'fill an empty field',
+  'replaces a guess': 'replace a value a tool guessed',
+  'had no picture': 'add a missing picture',
+  'AmiiboAPI and amiibo life agree': 'correct a release date both sources agree on',
+};
+
+/** Update Database: how many fields on how many amiibo, and why. */
+function explainDbUpdate(report) {
+  const sections = report.sections || {};
+  const changes = sections.changes || [];
+  const amiibo = new Set(changes.map((change) => change.id)).size;
+  const tally = (list, keyOf) => list.reduce((map, item) => map.set(keyOf(item), (map.get(keyOf(item)) || 0) + 1), new Map());
+  const what = [...tally(changes, (change) => (change.field === 'image' ? 'picture' : /^release\./.test(change.field) ? 'release date' : 'detail'))]
+    .map(([kind, n]) => plural(n, kind));
+  const why = [...tally(changes, (change) => change.why)].map(([reason, n]) => `${n} ${WHY_TEXT[reason] || reason}`);
+
+  const info = [];
+  if (why.length === 1 && changes.length > 1) info.push(`All of them ${WHY_TEXT[changes[0].why] || changes[0].why}.`);
+  else if (why.length) info.push(`${joinAnd(why)}.`);
+  if (sections.disagreements?.length) info.push(`${plural(sections.disagreements.length, 'value')} where a source disagrees with ours: left as they are (see “A source disagrees”).`);
+  if (sections.kept?.length) info.push(`${plural(sections.kept.length, 'edit')} you made by hand kept.`);
+  if (sections.notMatched?.length) info.push(`${plural(sections.notMatched.length, 'same-name amiibo', 'same-name amiibo')} from another series ignored.`);
+
+  const check = [];
+  const corrected = changes.filter((change) => change.why === 'AmiiboAPI and amiibo life agree').length;
+  if (corrected) check.push(`${plural(corrected, 'release date')} that we already had ${corrected === 1 ? 'is' : 'are'} corrected because both sources agree. Worth a quick look in Changes.`);
+  return {
+    found: changes.length > 0,
+    headline: changes.length ? `${plural(changes.length, 'change')} to ${plural(amiibo, 'amiibo', 'amiibo')}: ${joinAnd(what)}.` : 'Nothing to change.',
+    check,
+    info,
+  };
+}
+
+/** For tools without their own explain(): the size of each list. */
+function explainGeneric(report, tool) {
+  const parts = Object.entries(report.sections || {}).filter(([, items]) => items.length)
+    .map(([key, items]) => `${tool.sections?.[key]?.title || key}: ${items.length}`);
+  return { found: parts.length > 0, headline: parts.length ? `${parts.join(' · ')}.` : 'Nothing found.', check: [], info: [] };
+}
+
+function duration(report) {
+  const ms = Date.parse(report.finishedAt) - Date.parse(report.startedAt);
+  if (!(ms > 0)) return '';
+  return ms < 60000 ? `${Math.round(ms / 1000)} s` : `${Math.round(ms / 60000)} min`;
+}
+
+/**
+ * A run in plain words: what it found, what happened to it, what to check and what to do
+ * next. ctx: run (its GitHub run), pr (the pull request it opened), previous (the report
+ * before it), review (on a pull request card: no outcome or next step), compact (tool page).
+ */
+function runSummary(tool, report, ctx = {}) {
+  const explained = (tool.explain || explainGeneric)(report, tool);
+  const guard = report.guard?.outcome || null;
+  const errors = report.errors || [];
+  const runFailed = ctx.run?.status === 'completed' && ctx.run.conclusion !== 'success';
+  const box = h('div', { class: 'summary stack' },
+    h('div', { class: 'row small' },
+      ctx.review ? null : pill(report.dryRun ? 'Dry run' : 'Pull request run', report.dryRun ? '' : 'ok'),
+      guardPill(guard),
+      errors.length ? pill(plural(errors.length, 'error'), 'warn') : pill('no errors', 'ok'),
+      h('span', { class: 'muted' }, `${ctx.review ? 'Run ' : ''}${when(report.startedAt)}${duration(report) ? ` · took ${duration(report)}` : ''}`)),
+    h('p', { class: 'headline' }, explained.headline));
+
+  if (!ctx.review) {
+    const outcome = outcomeLine(report, explained, ctx, runFailed);
+    box.append(h('p', { class: outcome.kind }, outcome.text));
+  }
+  const check = [
+    ...(errors.length ? [`${plural(errors.length, 'error')} while reading the sources, so this run may have missed some. See Errors in the full report.`] : []),
+    ...explained.check,
+  ];
+  if (check.length) {
+    box.append(h('div', { class: 'check' },
+      h('strong', {}, ctx.review ? 'Check before merging' : 'Worth checking'),
+      h('ul', {}, check.map((line) => h('li', {}, line)))));
+  }
+  if (explained.info?.length) box.append(h('ul', { class: 'info small muted' }, explained.info.map((line) => h('li', {}, line))));
+  const sources = sourcesLine(report);
+  if (sources) box.append(sources);
+  const compared = ctx.previous ? compareLine(tool, report, ctx.previous) : null;
+  if (compared) box.append(h('p', { class: 'small' }, compared));
+  if (!ctx.review) {
+    const next = nextStep(tool, report, explained, ctx, runFailed);
+    if (next) box.append(next);
+  }
+  return box;
+}
+
+/** What became of the run's results: dry run, pull request (and its state), or blocked. */
+function outcomeLine(report, explained, ctx, runFailed) {
+  const guard = report.guard?.outcome;
+  const where = ctx.compact ? 'in the full report' : 'below';
+  if (guard === 'failure') {
+    return {
+      kind: 'error',
+      text: report.dryRun
+        ? `The Guard would block these results (they change or remove something), so a pull request run wouldn’t open a pull request. See Guard ${where}.`
+        : `The Guard blocked these results (they change or remove something), so no pull request was opened. See Guard ${where}.`,
+    };
+  }
+  if (runFailed || (guard && guard !== 'success')) return { kind: 'error', text: 'The run failed after the search, so nothing was proposed. The log says why.' };
+  if (report.dryRun) return { kind: 'muted', text: 'Dry run: nothing was changed and no pull request was opened.' };
+  if (!explained.found) return { kind: 'muted', text: 'Nothing to propose, so no pull request was opened.' };
+  const pr = ctx.pr;
+  if (!pr) return { kind: 'muted', text: 'Proposed as a pull request.' };
+  if (pr.merged_at) return { kind: 'ok', text: `Proposed in pull request #${pr.number}, merged ${when(pr.merged_at)}.` };
+  if (pr.state === 'closed') return { kind: 'muted', text: `Proposed in pull request #${pr.number}, closed without merging.` };
+  return { kind: 'warn', text: `Proposed in pull request #${pr.number}, waiting for your review.` };
+}
+
+function nextStep(tool, report, explained, ctx, runFailed) {
+  const logUrl = ctx.run?.html_url || report.runUrl;
+  if (report.guard?.outcome === 'failure' || runFailed) {
+    return logUrl ? h('div', { class: 'row next' }, h('span', { class: 'small' }, 'Next: open the log to see why.'), link('Open the log', logUrl)) : null;
+  }
+  if (report.dryRun && explained.found) {
+    return h('div', { class: 'next stack' },
+      h('p', { class: 'small' }, 'Next: if these look right, Run and open PR proposes them as a pull request. It searches again, so the result can differ slightly. Nothing changes until you merge.'),
+      h('div', {}, h('button', { type: 'button', onclick: () => runTool(tool, false, report.options || {}) }, 'Run and open PR')));
+  }
+  if (!report.dryRun && explained.found && ctx.pr?.state === 'open') {
+    return h('div', { class: 'next stack' },
+      h('p', { class: 'small' }, 'Next: look it over in Review (it has a preview of how it looks in the app), then merge.'),
+      h('div', {}, h('button', { type: 'button', onclick: () => showTab('review') }, `Review #${ctx.pr.number}`)));
+  }
+  if (!explained.found) return h('p', { class: 'small muted' }, 'Nothing to do.');
+  return null;
+}
+
+/** "Read: AmiiboAPI 932 · amiibo life 964 · …", with failures called out. */
+function sourcesLine(report) {
+  const entries = Object.entries(report.sources || {});
+  if (!entries.length) return null;
+  const failed = entries.filter(([, source]) => source.failed > 0);
+  const parts = entries.map(([name, source]) =>
+    !source.read && !source.failed ? `${name}: ${source.note || 'not read'}` : `${name} ${source.read}${source.failed ? ` (${source.failed} failed)` : ''}${source.note ? ` (${source.note})` : ''}`);
+  return h('p', { class: `small ${failed.length ? 'warn' : 'muted'}` },
+    `Read: ${parts.join(' · ')}. ${failed.length ? `Some pages from ${joinAnd(failed.map(([name]) => name))} couldn’t be read, so the results may be incomplete.` : 'Nothing failed.'}`);
+}
+
+/** How this run's main list differs from the run before it. */
+function compareLine(tool, report, previous) {
+  const meta = tool.sections?.[tool.main];
+  if (!meta?.key) return null;
+  const now = report.sections?.[tool.main] || [];
+  const before = previous.sections?.[tool.main] || [];
+  const beforeKeys = new Set(before.map(meta.key));
+  const nowKeys = new Set(now.map(meta.key));
+  const fresh = now.filter((item) => !beforeKeys.has(meta.key(item)));
+  const gone = before.filter((item) => !nowKeys.has(meta.key(item)));
+  const since = `the previous run (${when(previous.startedAt)})`;
+  if (!fresh.length && !gone.length) return now.length ? `Same ${meta.title.toLowerCase()} as ${since}.` : null;
+  const parts = [];
+  if (fresh.length) parts.push(`${fresh.length} not in ${since}: ${someNames(fresh.map((item) => item.name))}`);
+  if (gone.length) parts.push(`${gone.length} from ${fresh.length ? 'it' : since} ${gone.length === 1 ? 'is' : 'are'} gone (merged since, or a source changed)`);
+  return `Compared with before: ${parts.join('; ')}.`;
+}
+
+// ─── Report lists ───────────────────────────────────────────────────
+
+const FIELD_LABELS = {
+  'release.na': 'Release date, North America',
+  'release.eu': 'Release date, Europe',
+  'release.jp': 'Release date, Japan',
+  'release.au': 'Release date, Australia',
+  image: 'Picture',
+  imageFallback: 'Backup picture',
+  character: 'Character',
+  gameSeries: 'Game series',
+  amiiboSeries: 'amiibo series',
+  series: 'amiibo series',
+  type: 'Type',
+  name: 'Name',
+};
+const fieldLabel = (field) => FIELD_LABELS[field] || field;
+
+function fieldValue(field, value) {
+  if (value === null || value === undefined || value === '') return h('span', { class: 'muted' }, 'empty');
+  if (field === 'image') {
+    if (value === 'placeholder') return 'our icon (no picture)';
+    if (value === 'missing') return h('span', { class: 'muted' }, 'none');
+    return /^https:/.test(value) ? link('new picture', value) : 'new picture';
+  }
+  if (/^release\./.test(field) && /^\d{4}-\d\d-\d\d$/.test(value)) return appDate(value);
+  return String(value);
+}
+
+function amiiboCell(item) {
+  return h('div', {}, h('strong', {}, item.name), h('div', { class: 'small muted' }, h('code', {}, item.id)));
+}
+
+function sourceNote(item) {
+  return h('div', { class: 'small muted' }, item.source || '', item.url ? [item.source ? ' · ' : '', link('page', item.url)] : null);
+}
+
+function details(summary, ...children) {
+  return h('details', {}, h('summary', {}, summary), ...children);
+}
+
+/** Readable reasons for SNM's "Not added" lines; anything else is shown as written. */
+function reasonText(reason) {
+  const older = reason.match(/^not in the catalogue under this name \(released before (\d{4}-\d\d-\d\d)\)/);
+  if (older) return `Older than our newest amiibo (${appDate(older[1])}), so not treated as new. Probably one we have under another name.`;
+  if (/add by hand/.test(reason)) return h('span', { class: 'warn' }, 'Looks new, but no source gave its series. Add it in Catalogue if it’s real.');
+  if (/same name as more than one/.test(reason)) return 'Same name as more than one amiibo we have.';
+  return reason.charAt(0).toUpperCase() + reason.slice(1);
+}
+
+/**
+ * A table that stays short: the first 30 rows, "Show all", and a filter box once it's
+ * long. rows: { cells: [...], text: what the filter searches }.
+ */
+function bigTable(headers, rows) {
+  const LIMIT = 30;
+  const tbody = h('tbody');
+  let showAll = rows.length <= LIMIT;
+  let query = '';
+  const more = h('button', { type: 'button', class: 'ghost small', onclick: () => { showAll = true; render(); } }, `Show all ${rows.length}`);
+  const empty = h('p', { class: 'small muted', hidden: true }, 'Nothing matches.');
+  const render = () => {
+    const matching = query ? rows.filter((row) => row.text.includes(query)) : rows;
+    const shown = showAll || query ? matching : matching.slice(0, LIMIT);
+    tbody.replaceChildren(...shown.map((row) => h('tr', {}, row.cells.map((cell) => h('td', {}, cell)))));
+    more.hidden = showAll || Boolean(query) || matching.length <= LIMIT;
+    empty.hidden = matching.length > 0;
+  };
+  const filter = rows.length > LIMIT
+    ? h('input', { type: 'search', class: 'filter', placeholder: 'Filter this list', autocomplete: 'off', oninput: (event) => { query = event.target.value.trim().toLowerCase(); render(); } })
+    : null;
+  render();
+  return h('div', { class: 'stack' },
+    filter,
+    h('div', { class: 'table-wrap' }, h('table', { class: 'compact' }, h('thead', {}, h('tr', {}, headers.map((title) => h('th', {}, title)))), tbody)),
+    empty,
+    more);
+}
+
+/** Path of a new amiibo's picture in the repo (the placeholder icon when it has none). */
+function addedImagePath(item) {
+  if (item.image === 'placeholder') return PLACEHOLDER_IMAGE;
+  return item.id.startsWith('ob-') ? `images/amiibo/${item.id}.webp` : `images/amiibo/${item.id.slice(0, 8)}-${item.id.slice(8)}.webp`;
+}
+
+function addedList(items, prBranch) {
+  const today = new Date().toISOString().slice(0, 10);
+  return h('ul', { class: 'list' }, items.map((item) => {
+    const facts = [
+      item.releaseDate ? `${item.releaseDate > today ? 'Releases' : 'Released'} ${appDate(item.releaseDate)}` : 'No release date yet',
+      item.image === 'placeholder' ? 'no picture yet (our icon)' : 'has a picture',
+      item.sources?.length ? `from ${joinAnd(item.sources)}` : null,
+      item.id.startsWith('ob-') ? `temporary id ${item.id}` : `id ${item.id}`,
+    ].filter(Boolean);
+    return h('li', { class: 'row top' },
+      prBranch ? repoImage(addedImagePath(item), prBranch, item.name) : null,
+      h('div', { class: 'grow' },
+        h('div', {}, h('strong', {}, item.name), h('span', { class: 'muted' }, ` · ${item.amiiboSeries}`)),
+        h('div', { class: 'small muted' }, facts.join(' · '), item.url ? [' · ', link('page', item.url)] : null),
+        importantGuesses(item).length ? h('div', { class: 'small warn' }, `Check: ${importantGuesses(item).join('; ')}`) : null));
+  }));
+}
+
+/** A report list drawn to fit what's in it: new amiibo, changes, disagreements, ids or listings. */
+function sectionBody(key, items) {
+  const first = items[0];
+  const text = (...parts) => parts.filter(Boolean).join(' ').toLowerCase();
+  if (first.field && 'from' in first && 'to' in first) {
+    return bigTable(['amiibo', 'What', 'Was', 'Now', 'Why'], items.map((item) => ({
+      text: text(item.name, item.id, fieldLabel(item.field)),
+      cells: [amiiboCell(item), fieldLabel(item.field), fieldValue(item.field, item.from), fieldValue(item.field, item.to),
+        [WHY_TEXT[item.why] ? WHY_TEXT[item.why].replace(/^./, (c) => c.toUpperCase()) : item.why, sourceNote(item)]],
+    })));
+  }
+  if (first.field && 'ours' in first) {
+    return bigTable(['amiibo', 'What', 'Ours', 'Source says', ''], items.map((item) => ({
+      text: text(item.name, item.id, fieldLabel(item.field)),
+      cells: [amiiboCell(item), fieldLabel(item.field), fieldValue(item.field, item.ours), [fieldValue(item.field, item.theirs), sourceNote(item)],
+        h('button', { type: 'button', class: 'ghost small', onclick: () => showTab(`catalogue/${encodeURIComponent(item.id)}`) }, 'Edit')],
+    })));
+  }
+  if (first.field && 'value' in first) {
+    return bigTable(['amiibo', 'What', 'Now', 'From'], items.map((item) => ({
+      text: text(item.name, item.id, fieldLabel(item.field)),
+      cells: [amiiboCell(item), fieldLabel(item.field), fieldValue(item.field, item.value), sourceNote(item)],
+    })));
+  }
+  if (first.from && first.to && !first.field) {
+    return bigTable(['amiibo', 'Temporary id', 'Real id'], items.map((item) => ({
+      text: text(item.name, item.from, item.to),
+      cells: [h('strong', {}, item.name), h('code', {}, item.from), h('code', {}, item.to)],
+    })));
+  }
+  if ('reason' in first) {
+    // Lines that need a person first.
+    const sorted = [...items].sort((a, b) => Number(/add by hand/.test(b.reason)) - Number(/add by hand/.test(a.reason)));
+    return bigTable(['Name', 'Series', 'Released', 'Why'], sorted.map((item) => {
+      const [source, ...rest] = item.reason.split(': ');
+      const reason = rest.length ? rest.join(': ') : item.reason;
+      return {
+        text: text(item.name, item.series),
+        cells: [item.url ? link(item.name, item.url) : item.name, item.series || '—', item.releaseDate ? appDate(item.releaseDate) : '—',
+          [reasonText(reason), rest.length ? h('div', { class: 'small muted' }, `from ${source}`) : null]],
+      };
+    }));
+  }
+  return h('ul', { class: 'list small' }, items.slice(0, 400).map((item) =>
+    h('li', {}, itemText(item).replace(/ \| https:\S+$/, ''), item.url ? [' ', link('page', item.url)] : null)));
+}
+
+/** The Guard's verdict in a sentence, its reasons when it blocked, the rest folded away. */
+function guardBlock(report) {
+  const text = report.guard?.report;
+  if (!text) return null;
+  const clean = (value) => value.replace(/\*\*/g, '').replace(/`/g, '').replace(/^#+\s*/gm, '');
+  const blocks = text.trim().split(/\n\n+/);
+  const blocked = report.guard.outcome === 'failure';
+  return h('div', { class: 'stack' },
+    h('h3', {}, 'Guard'),
+    h('p', { class: blocked ? 'error' : '' }, clean(blocks[0])),
+    h('p', { class: 'small muted' }, 'The Guard makes sure a pull request only adds amiibo and fills empty fields. Changed values, removals and very large changes are blocked unless the pull request has a label that allows them.'),
+    blocked && blocks[1] ? h('ul', { class: 'small error' }, blocks[1].split('\n').map((line) => h('li', {}, clean(line.replace(/^- /, ''))))) : null,
+    blocks.length > 1 ? details('Full Guard report', h('pre', {}, clean(blocks.slice(1).join('\n\n')))) : null);
+}
+
+/** Each list in the report with what it means, then errors, the Guard and the run log. */
+function reportSections(tool, report, prBranch) {
+  const wrap = h('div', { class: 'stack' });
+  const sections = report.sections || {};
+  const order = [...Object.keys(tool.sections), ...Object.keys(sections).filter((key) => !(key in tool.sections))];
+  for (const key of order) {
+    const items = sections[key] || [];
+    if (!items.length) continue;
+    const meta = tool.sections[key] || { title: key };
+    const help = meta.help ? h('p', { class: 'small muted' }, meta.help) : null;
+    const body = key === tool.main && items[0].amiiboSeries !== undefined && items[0].id ? addedList(items, prBranch) : sectionBody(key, items);
+    if (meta.fold) wrap.append(details(`${meta.title} (${items.length})`, help, body));
+    else wrap.append(h('h3', {}, `${meta.title} (${items.length})`), ...[help, body].filter(Boolean));
+  }
+  if (!wrap.childNodes.length) wrap.append(h('p', { class: 'muted' }, 'Nothing listed in this run.'));
+  if (report.errors?.length) {
+    wrap.append(h('h3', {}, `Errors (${report.errors.length})`), h('ul', { class: 'list small' }, report.errors.map((error) => h('li', { class: 'error' }, error))));
+  }
+  const guard = guardBlock(report);
+  if (guard) wrap.append(guard);
+  if (report.log?.length) {
+    wrap.append(details('Run log (technical)', h('pre', {}, report.log.map((line) => (line.length > 300 ? `${line.slice(0, 300)}…` : line)).join('\n'))));
+  }
+  return wrap;
 }
 
 /** One line of text for any report item (new amiibo, change, disagreement, …). */
@@ -858,19 +1485,24 @@ function itemText(item) {
   return `${item.name}${item.series ? ` | ${item.series}` : ''}${item.releaseDate ? ` | ${item.releaseDate}` : ''} | ${item.reason || ''}${item.url ? ` | ${item.url}` : ''}`;
 }
 
-/** The whole report as plain text: every item, the guard result and the run log. */
+/** The whole report as plain text: the summary, every item, the guard result and the run log. */
 function reportToText(tool, report) {
+  const explained = (tool.explain || explainGeneric)(report, tool);
   const lines = [
     `${tool.title} run ${report.runId}`,
     `Started: ${report.startedAt}  Finished: ${report.finishedAt || '?'}`,
-    `Kind: ${report.dryRun ? 'dry run' : 'pull request run'}  Guard: ${report.guard?.outcome || '?'}`,
+    `Kind: ${report.dryRun ? 'dry run' : 'pull request run'}  Guard: ${report.guard?.outcome || '?'}${report.options ? `  Options: ${Object.entries(report.options).map(([key, value]) => `${key}=${value}`).join(', ')}` : ''}`,
     report.runUrl ? `Log: ${report.runUrl}` : '',
+    '',
+    `RESULT: ${explained.headline}`,
+    ...explained.check.map((line) => `CHECK: ${line}`),
+    ...(explained.info || []).map((line) => `NOTE: ${line}`),
     '',
     'SOURCES',
     ...Object.entries(report.sources || {}).map(([name, s]) => `  ${name}: ${s.read} read, ${s.failed} failed${s.note ? ` (${s.note})` : ''}`),
   ];
   for (const [key, items] of Object.entries(report.sections || {})) {
-    lines.push('', `${(tool.sections[key] || key).toUpperCase()} (${items.length})`);
+    lines.push('', `${(tool.sections[key]?.title || key).toUpperCase()} (${items.length})`);
     for (const item of items) lines.push(`  - ${itemText(item)}`);
   }
   lines.push('', `ERRORS (${(report.errors || []).length})`, ...(report.errors || []).map((e) => `  - ${e}`));
@@ -907,45 +1539,6 @@ async function exportRuns(tool, index) {
   } catch (error) {
     toast(`Couldn’t export: ${error.message}`, true);
   }
-}
-
-/** Sources table, then each section of the report, errors, guard and log. */
-async function reportDetails(tool, report, prBranch) {
-  const wrap = h('div', { class: 'stack' });
-  wrap.append(h('div', { class: 'table-wrap' }, h('table', {},
-    h('thead', {}, h('tr', {}, ...['Source', 'Read', 'Failed', 'Note'].map((t) => h('th', {}, t)))),
-    h('tbody', {}, Object.entries(report.sources || {}).map(([name, s]) =>
-      h('tr', {}, h('td', {}, name), h('td', {}, String(s.read)), h('td', {}, s.failed ? pill(String(s.failed), 'warn') : '0'), h('td', { class: 'small muted' }, s.note || '')))))));
-
-  const sections = report.sections || {};
-  const order = [...Object.keys(tool.sections), ...Object.keys(sections).filter((key) => !(key in tool.sections))];
-  for (const key of order) {
-    const items = sections[key] || [];
-    if (!items.length) continue;
-    const title = `${tool.sections[key] || key} (${items.length})`;
-    if (key === 'added') {
-      wrap.append(h('h3', {}, title));
-      const list = h('ul', { class: 'list' });
-      for (const item of items) {
-        const img = prBranch
-          ? await repoImage(item.image === 'placeholder' ? PLACEHOLDER_IMAGE : item.id.startsWith('ob-') ? `images/amiibo/${item.id}.webp` : `images/amiibo/${item.id.slice(0, 8)}-${item.id.slice(8)}.webp`, prBranch, item.name)
-          : h('span', {});
-        list.append(h('li', { class: 'row' }, img,
-          h('div', {},
-            h('strong', {}, item.name), ` (${item.amiiboSeries}) `, h('code', {}, item.id),
-            h('div', { class: 'small muted' }, `${item.releaseDate || 'no date'} · ${item.image === 'placeholder' ? 'placeholder picture' : 'picture'}${item.sources ? ` · from ${item.sources.join(', ')}` : ''} `, item.url ? link('page', item.url) : null),
-            item.guessed?.length ? h('div', { class: 'small warn' }, `Check: ${item.guessed.join('; ')}`) : null)));
-      }
-      wrap.append(list);
-    } else {
-      wrap.append(h('h3', {}, title), h('ul', { class: 'list small' }, items.slice(0, 400).map((item) =>
-        h('li', {}, itemText(item).replace(/ \| https:\S+$/, ''), item.url ? [' ', link('page', item.url)] : null))));
-    }
-  }
-  if (report.errors?.length) wrap.append(h('h3', {}, `Errors (${report.errors.length})`), h('ul', { class: 'list small' }, report.errors.map((e) => h('li', { class: 'error' }, e))));
-  if (report.guard?.report) wrap.append(h('h3', {}, 'Guard'), h('pre', {}, report.guard.report));
-  if (report.log?.length && !prBranch) wrap.append(h('h3', {}, 'Run log'), h('pre', {}, report.log.join('\n')));
-  return wrap;
 }
 
 // ─── Catalogue (view, edit, promote) ───────────────────────────────
