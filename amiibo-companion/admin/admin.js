@@ -62,7 +62,7 @@ const TOOLS = [
       changes: { title: 'Changes', help: 'What merging changes. Each one fills an empty field or picture, replaces a value a tool guessed, or corrects a release date AmiiboAPI and amiibo life agree on.', key: (item) => `${item.id}|${item.field}|${item.to}` },
       disagreements: { title: 'A source disagrees (not changed)', help: 'Ours stays as it is. Usually ours is right (sources mix up re-releases and bundles). If the source is right, fix it with Edit; the tools never overwrite your edits.', fold: true },
       kept: { title: 'Your edits kept', help: 'You set these by hand, so the tool left them alone even though a source says otherwise.', fold: true },
-      notMatched: { title: 'Same name, different series (not used)', help: 'A source has an amiibo with the same name as one of ours but in another series, so it was ignored (for example Monster Hunter’s Rudy and Animal Crossing’s Rudy).', fold: true },
+      notMatched: { title: 'Same name, different amiibo (not used)', help: 'A source has an amiibo with the same name as one of ours, but in another series and with no release date in common, so it was ignored (Monster Hunter’s Rudy isn’t the Animal Crossing card; amiibo life’s Series 4 Timmy isn’t our Series 1 Timmy).', fold: true },
       skipped: { title: 'Skipped by you', help: 'You dropped these from an earlier pull request, so they were left out. Allow one again on this tool’s page.', fold: true },
     },
     brief: (counts) => (counts.changes ? `${counts.changes} change${counts.changes === 1 ? '' : 's'}` : 'Nothing to change'),
@@ -1246,6 +1246,7 @@ function changesView({ data, report, ref, onChange, onEdit }) {
         h('div', { class: 'change-grid new' },
           rows.flatMap(([label, value, note]) => [h('span', { class: 'muted' }, label), h('span', {}, value), h('span', { class: 'small' }, note)]),
           h('span', { class: 'muted' }, 'Released'), h('span', { class: 'span' }, dates)),
+        ...wholeNotes(guessed).map((text) => h('div', { class: 'small warn' }, text.replace(/^./, (c) => c.toUpperCase()))),
         about && (about.sources?.length || about.url)
           ? h('div', { class: 'small muted' }, about.sources?.length ? `From ${joinAnd(about.sources)}` : 'Source', about.url ? [about.sources?.length ? ' · ' : ': ', link('page', about.url)] : null)
           : null);
@@ -1862,6 +1863,11 @@ function importantGuesses(item) {
   return (item.guessed || []).filter((text) => !/^character /.test(text));
 }
 
+/** Notes about the whole amiibo rather than one field ("released before our newest amiibo…"). */
+function wholeNotes(guessed) {
+  return (guessed || []).filter((text) => /before our newest amiibo|placeholder icon/.test(text));
+}
+
 /** SNM: new amiibo, real ids, and what a person should look at. */
 function explainSnm(report) {
   const sections = report.sections || {};
@@ -1876,8 +1882,10 @@ function explainSnm(report) {
   const counts = new Map();
   let guessed = 0;
   let characters = 0;
+  const missed = added.filter((item) => (item.guessed || []).some((text) => /before our newest amiibo/.test(text)));
+  if (missed.length) check.push(`${someNames(missed.map((item) => item.name))} came out before our newest amiibo but ${missed.length === 1 ? 'isn’t' : 'aren’t'} in the catalogue (AmiiboAPI missed ${missed.length === 1 ? 'it' : 'them'}). Check ${missed.length === 1 ? 'it’s' : 'they’re'} really missing.`);
   for (const item of added) {
-    const important = importantGuesses(item);
+    const important = importantGuesses(item).filter((text) => !/before our newest amiibo/.test(text));
     if (important.length) guessed++;
     if (important.length < (item.guessed?.length || 0)) characters++;
     for (const text of important) {
