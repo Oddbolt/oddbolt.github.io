@@ -204,3 +204,5 @@ label.keep input { width: auto; margin: 0; accent-color: var(--accent); }
   .change-grid:not(.new):not(.all) > :nth-child(4n) { grid-column: 1 / -1; }
   .change-grid:not(.new):not(.all) > .head:nth-child(4n) { display: none; }
 }
+.change-head .edit { margin-left: auto; }
+.change-head .edit + label.keep { margin-left: 0; }

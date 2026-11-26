@@ -650,12 +650,13 @@ async function showTools(toolId, kind, runId) {
  */
 async function refreshToolLive(tool, live, hash) {
   clearTimeout(state.pollTimer);
-  const [index, runs, latest, pulls, skipList] = await Promise.all([
+  const [index, runs, latest, pulls, skipList, editList] = await Promise.all([
     fileJson(`${tool.id}/index.json`, REPORTS_BRANCH).catch(() => null),
     gh(repoPath(`/actions/workflows/${tool.workflow}/runs?per_page=15`)).catch(() => ({ workflow_runs: [] })),
     fileJson(`${tool.id}/latest.json`, REPORTS_BRANCH).catch(() => null),
     gh(repoPath('/pulls?state=open&per_page=30')).catch(() => []),
     readSkipList().catch(() => ({ data: {} })),
+    readMetaList(EDITS).catch(() => ({ data: {} })),
   ]);
   if (currentHash !== hash || !live.isConnected) return;
   const list = index || [];
@@ -695,6 +696,7 @@ async function refreshToolLive(tool, live, hash) {
       h('p', { class: 'small muted' }, 'Tap a run for its full report.'),
       runList(tool, rows)),
     skippedCard(tool, Array.isArray(skipList.data[tool.id]) ? skipList.data[tool.id] : []),
+    editsCard(tool, Array.isArray(editList.data[tool.id]) ? editList.data[tool.id] : []),
   ].filter(Boolean));
 
   if (rows.some((row) => row.active)) {
@@ -845,12 +847,20 @@ async function reviewCard(pr) {
         : `Keeping all ${plural(changes.total, 'change')}. Untick anything you don’t want, then Drop.`;
       dropButton.onclick = () => dropFromPr({ pr, tool, data, dropped: changes.dropped(), remember: Boolean(remember?.checked), closeInstead: everything });
     };
-    changes = changesView({ data, report, ref: pr.head.sha, onChange: update });
+    changes = changesView({
+      data,
+      report,
+      ref: pr.head.sha,
+      onChange: update,
+      onEdit: (item, fields) => (card.dataset.dirty
+        ? toast('Tick everything again (or Drop the unticked ones) before editing.', true)
+        : editInPr({ pr, tool, data, item, fields })),
+    });
     const counts = ['added', 'promoted', 'changed', 'removed'].map((kind) => [kind, data.items.filter((item) => item.kind === kind).length]).filter(([, n]) => n);
     const words = { added: 'new', promoted: 'real ids', changed: 'changed', removed: 'removed' };
     card.append(
       h('h3', {}, `Changes: ${counts.map(([kind, n]) => `${n} ${words[kind]}`).join(', ')}`),
-      h('p', { class: 'small muted' }, 'Each amiibo as it is now next to how it will be after merging (only what changes; “All details” shows the rest). Everything ticked gets merged.'),
+      h('p', { class: 'small muted' }, 'Each amiibo as it is now next to how it will be after merging (only what changes; “All details” shows the rest). Everything ticked gets merged. Edit sets your own value instead.'),
       changes.node,
       h('div', { class: 'dropbar stack' },
         dropInfo,
@@ -1021,6 +1031,13 @@ async function closePr(pr) {
 const FIELD_ORDER = ['name', 'character', 'amiiboSeries', 'gameSeries', 'type', 'release.na', 'release.eu', 'release.jp', 'release.au', 'image', 'imageFallback', 'source'];
 const HIDDEN_FIELDS = new Set(['id', 'head', 'tail', 'aliases', 'release']);
 const SKIPPED = 'meta/skipped.json';
+const EDITS = 'meta/edits.json';
+/** Fields you can set on a pull request before merging (pictures are the tools' job). */
+const PR_EDITABLE = ['name', 'character', 'amiiboSeries', 'gameSeries', 'type', 'release.na', 'release.eu', 'release.jp', 'release.au'];
+const ABOUT = {
+  [SKIPPED]: 'What you dropped in Remote Admin. The tools don’t propose these again. To undo one, use Allow again on the tool’s page in Remote Admin.',
+  [EDITS]: 'Values you set in Remote Admin on a tool’s pull request before merging. The tools apply them each time they rebuild it. Forget them on the tool’s page in Remote Admin.',
+};
 
 const fieldGet = (entry, path) => (path.startsWith('release.') ? entry.release?.[path.slice(8)] : entry[path]) ?? null;
 const orderOf = (path) => (FIELD_ORDER.includes(path) ? FIELD_ORDER.indexOf(path) : FIELD_ORDER.length);
@@ -1070,13 +1087,14 @@ async function allPrFiles(number) {
 async function prChanges(pr) {
   const compare = await gh(repoPath(`/compare/main...${pr.head.sha}?per_page=1`));
   const baseSha = compare.merge_base_commit.sha;
-  const [base, head, files] = await Promise.all([
+  const [base, head, files, headProvenance] = await Promise.all([
     fileJson('data/catalogue.json', baseSha),
     fileJson('data/catalogue.json', pr.head.sha),
     allPrFiles(pr.number),
+    fileJson(PROVENANCE, pr.head.sha).catch(() => null),
   ]);
   const newFiles = new Set(files.filter((file) => file.status === 'added').map((file) => file.filename));
-  return { baseSha, base, head, files, newFiles, items: diffCatalogues(base, head, newFiles) };
+  return { baseSha, base, head, files, newFiles, headProvenance, items: diffCatalogues(base, head, newFiles) };
 }
 
 function diffCatalogues(base, head, newFiles) {
@@ -1169,7 +1187,7 @@ const KIND_PILL = { added: ['New', 'ok'], promoted: ['Real id', 'ok'], changed: 
  * change (a whole new amiibo, a real id, or one field). onChange runs when a box changes.
  * Returns { node, dropped(), total, describe(dropped) }.
  */
-function changesView({ data, report, ref, onChange }) {
+function changesView({ data, report, ref, onChange, onEdit }) {
   const info = reportInfo(report);
   const keep = new Map();
   const boxes = [];
@@ -1198,6 +1216,10 @@ function changesView({ data, report, ref, onChange }) {
       loaders.push(() => slot.replaceWith(make()));
       return slot;
     };
+    // Set by you in Remote Admin (marked "manual" in the pull request's provenance).
+    const yours = (path) => data.headProvenance?.[item.id]?.[path]?.source === 'manual';
+    const editable = item.kind === 'added' ? PR_EDITABLE : item.kind === 'changed' ? item.rows.filter((row) => !row.picture && PR_EDITABLE.includes(row.paths[0])).map((row) => row.paths[0]) : [];
+    const editButton = onEdit && editable.length ? h('button', { type: 'button', class: 'ghost small edit', onclick: () => onEdit(item, editable) }, 'Edit') : null;
     const head = h('div', { class: 'change-head' },
       later(() => (item.kind === 'added' || item.kind === 'promoted' ? pictureCell(entry.image, ref) : amiiboImage(entry))),
       h('div', { class: 'grow' },
@@ -1208,14 +1230,16 @@ function changesView({ data, report, ref, onChange }) {
       const about = info.added.get(item.id);
       const guessed = about?.guessed || [];
       const update = () => card.classList.toggle('dropped', !keep.get(item.key));
-      head.append(box(item.key, 'Keep', update));
+      head.append(...[editButton, box(item.key, 'Keep', update)].filter(Boolean));
       const rows = ['amiiboSeries', 'gameSeries', 'character', 'type'].map((path) => {
-        const note = guessNote(guessed, path);
-        return [fieldLabel(path), String(fieldGet(entry, path) ?? ''), note ? h('span', { class: path === 'character' ? 'muted' : 'warn' }, note) : ''];
+        const note = yours(path) ? null : guessNote(guessed, path);
+        return [fieldLabel(path), String(fieldGet(entry, path) ?? ''),
+          yours(path) ? h('span', { class: 'ok' }, 'your value') : note ? h('span', { class: path === 'character' ? 'muted' : 'warn' }, note) : ''];
       });
+      if (yours('name')) rows.unshift([fieldLabel('name'), entry.name, h('span', { class: 'ok' }, 'your value')]);
       const dates = REGIONS.map((region) => {
         const value = entry.release?.[region];
-        const note = guessNote(guessed, `release.${region}`);
+        const note = yours(`release.${region}`) ? 'your value' : guessNote(guessed, `release.${region}`);
         return `${region.toUpperCase()} ${value ? appDate(value) : '—'}${note ? ` (${note})` : ''}`;
       }).join(' · ');
       card.append(head,
@@ -1252,10 +1276,11 @@ function changesView({ data, report, ref, onChange }) {
         });
         head.append(h('label', { class: 'keep' }, all, 'Keep all'));
       }
+      if (editButton) head.insertBefore(editButton, head.querySelector('label.keep'));
       const grid = h('div', { class: 'change-grid' }, gridHeader());
       for (const row of item.rows) {
         const about = info.changes.get(`${item.id}|${row.paths[0]}`);
-        const nodes = changeRow(row, box(row.key, row.label, update), ref, about);
+        const nodes = changeRow(row, box(row.key, row.label, update), ref, about, yours(row.paths[0]));
         rowNodes.push(nodes);
         grid.append(...nodes);
       }
@@ -1334,10 +1359,12 @@ function gridHeader(compact = false) {
 }
 
 /** One changed field: [label or tick box, now, after merge, why]. */
-function changeRow(row, label, ref, about) {
+function changeRow(row, label, ref, about, isYours = false) {
   const before = row.picture ? pictureCell(row.before, null) : fieldValue(row.paths[0], row.before);
   const after = row.picture ? pictureCell(row.after, ref) : fieldValue(row.paths[0], row.after);
-  const why = about
+  const why = isYours
+    ? h('span', { class: 'small ok' }, 'Your value')
+    : about
     ? h('span', { class: 'small muted' }, WHY_TEXT[about.why] ? WHY_TEXT[about.why].replace(/^./, (c) => c.toUpperCase()) : about.why || '', about.source ? ` · ${about.source}` : '', about.url ? [' · ', link('page', about.url)] : null)
     : h('span');
   return [label || h('span', { class: 'muted' }, row.label), h('span', {}, before), h('span', {}, after), why];
@@ -1354,10 +1381,33 @@ function droppedCount(dropped) {
   return dropped.reduce((sum, { rows }) => sum + (rows ? rows.length : 1), 0);
 }
 
+/**
+ * The name and amiibo series SNM itself gives a new amiibo, which your values may have
+ * changed since: what the skip list and your values match it by.
+ */
+function snmIdentity(entry, edits) {
+  const norm = (text) => String(text || '').trim().toLowerCase();
+  const groups = new Map();
+  for (const item of Array.isArray(edits) ? edits : []) {
+    if (!item.match) continue;
+    const key = JSON.stringify(item.match);
+    groups.set(key, [...(groups.get(key) || []), item]);
+  }
+  for (const items of groups.values()) {
+    const { match } = items[0];
+    const latest = (field) => [...items].reverse().find((item) => item.field === field)?.value;
+    if (norm(latest('name') ?? match.name) === norm(entry.name) && norm(latest('amiiboSeries') ?? match.amiiboSeries) === norm(entry.amiiboSeries)) return match;
+  }
+  return { name: entry.name, amiiboSeries: entry.amiiboSeries };
+}
+
 /** What goes on the skip list for each dropped change. */
-function skipEntries({ item, rows }) {
+function skipEntries({ item, rows }, edits = []) {
   const stamp = { at: new Date().toISOString(), by: state.user.login };
-  if (item.kind === 'added') return [{ name: item.entry.name, amiiboSeries: item.entry.amiiboSeries, ...stamp }];
+  if (item.kind === 'added') {
+    const { name, amiiboSeries } = snmIdentity(item.entry, edits);
+    return [{ name, amiiboSeries, ...stamp }];
+  }
   if (item.kind === 'promoted') return [{ name: item.entry.name, from: item.from, to: item.id, ...stamp }];
   return rows.map((row) => ({ name: `${item.entry.name}: ${row.label}`, id: item.id, field: row.skipField, value: row.skipValue, ...stamp }));
 }
@@ -1367,10 +1417,10 @@ function base64ToUtf8(base64) {
   return new TextDecoder().decode(Uint8Array.from(binary, (char) => char.charCodeAt(0)));
 }
 
-/** The skip list on main, with its file sha (null if it doesn't exist yet). */
-async function readSkipList() {
+/** A list file on main (skip list, your values), with its sha (null if it doesn't exist yet). */
+async function readMetaList(path) {
   try {
-    const meta = await gh(repoPath(`/contents/${SKIPPED}?ref=main`));
+    const meta = await gh(repoPath(`/contents/${path}?ref=main`));
     return { sha: meta.sha, data: JSON.parse(base64ToUtf8(meta.content)) };
   } catch (error) {
     if (error.status === 404) return { sha: null, data: {} };
@@ -1378,17 +1428,19 @@ async function readSkipList() {
   }
 }
 
+const readSkipList = () => readMetaList(SKIPPED);
+
 /**
- * Changes the skip list straight on main: it isn't published data, and a tool run must see
+ * Changes a list file straight on main: it isn't published data, and a tool run must see
  * it before the pull request is merged. Retries once if it changed meanwhile.
  */
-async function writeSkipList(mutate, message) {
+async function writeMetaList(path, mutate, message) {
   for (let attempt = 0; ; attempt++) {
-    const { sha, data } = await readSkipList();
-    data.about = 'What you dropped in Remote Admin. The tools don’t propose these again. To undo one, use Allow again on the tool’s page in Remote Admin.';
+    const { sha, data } = await readMetaList(path);
+    data.about = ABOUT[path];
     mutate(data);
     try {
-      await gh(repoPath(`/contents/${SKIPPED}`), {
+      await gh(repoPath(`/contents/${path}`), {
         method: 'PUT',
         body: { message, content: utf8ToBase64(`${JSON.stringify(data, null, 2)}\n`), branch: 'main', ...(sha ? { sha } : {}) },
       });
@@ -1497,8 +1549,9 @@ async function dropFromPr({ pr, tool, data, dropped, remember, closeInstead }) {
   }
   if (remember) {
     try {
-      await writeSkipList((list) => {
-        list[tool.id] = [...(Array.isArray(list[tool.id]) ? list[tool.id] : []), ...dropped.flatMap(skipEntries)];
+      const edits = (await readMetaList(EDITS).catch(() => ({ data: {} }))).data[tool.id];
+      await writeMetaList(SKIPPED, (list) => {
+        list[tool.id] = [...(Array.isArray(list[tool.id]) ? list[tool.id] : []), ...dropped.flatMap((drop) => skipEntries(drop, edits))];
       }, `Skip list: ${count} from ${tool.name} (Remote Admin)`);
     } catch (error) {
       toast(`Dropped, but couldn’t save the skip list (${error.message}), so ${tool.name} may propose ${count === 1 ? 'it' : 'them'} again.`, true);
@@ -1507,6 +1560,127 @@ async function dropFromPr({ pr, tool, data, dropped, remember, closeInstead }) {
   }
   toast(closeInstead ? `Closed #${pr.number}.` : `Dropped ${plural(count, 'change')}. The Guard is checking #${pr.number} again; merge when it says Ready.`);
   showTab('review');
+}
+
+/**
+ * Sets values on one amiibo in a pull request before it's merged: one commit on its
+ * branch, the fields marked yours ("manual", so the tools never change them), a note on
+ * the pull request, and for a tool's pull request the values saved to meta/edits.json, so
+ * the tool keeps them when it rebuilds the pull request.
+ */
+async function editInPr({ pr, tool, data, item, fields }) {
+  const { entry } = item;
+  const suggestions = new Map(['amiiboSeries', 'gameSeries', 'character', 'type'].map((key) =>
+    [key, [...new Set(data.head.amiibo.map((other) => other[key]).filter(Boolean))].sort()]));
+  const inputs = {};
+  const body = [h('p', { class: 'small muted' }, item.kind === 'added'
+    ? 'Change anything that’s wrong. Your values are marked as yours, so the tools never change them.'
+    : 'Set the value you want instead of the proposed one. It’s marked as yours, so the tools never change it.')];
+  for (const path of fields) {
+    const isDate = path.startsWith('release.');
+    const listId = suggestions.has(path) ? `values-${path}` : null;
+    const input = h('input', { value: fieldGet(entry, path) ?? '', placeholder: isDate ? 'YYYY-MM-DD, or empty' : '', autocomplete: 'off', spellcheck: 'false', ...(listId ? { list: listId } : {}) });
+    inputs[path] = input;
+    const now = item.kind === 'changed' ? fieldGet(item.old, path) : undefined;
+    body.push(h('label', {},
+      fieldLabel(path),
+      item.kind === 'changed' ? h('span', { class: 'muted' }, ` (now: ${now === null ? 'empty' : isDate ? appDate(now) : now})`) : null,
+      input));
+    if (listId) body.push(h('datalist', { id: listId }, suggestions.get(path).map((value) => h('option', { value }))));
+  }
+  if (tool?.reports) body.push(h('p', { class: 'small muted' }, `Saved so ${tool.name} keeps them when it rebuilds this pull request. The Guard then checks it again (about a minute).`));
+  if (!(await confirmDialog(`Edit ${entry.name}`, body, 'Save'))) return;
+
+  const changes = [];
+  const problems = [];
+  for (const path of fields) {
+    const raw = inputs[path].value.trim();
+    const isDate = path.startsWith('release.');
+    if (isDate && raw && !/^\d{4}-\d{2}-\d{2}$/.test(raw)) problems.push(`${fieldLabel(path)} must be YYYY-MM-DD.`);
+    if (!isDate && !raw) problems.push(`${fieldLabel(path)} can’t be empty.`);
+    const value = raw || null;
+    if (value !== fieldGet(entry, path)) changes.push([path, value]);
+  }
+  if (problems.length) return toast(problems.join(' '), true);
+  if (!changes.length) return toast('Nothing changed.');
+  const lines = changes.map(([path, value]) => `${fieldLabel(path)}: ${value ?? '(empty)'}`);
+  try {
+    const ref = await gh(repoPath(`/git/ref/heads/${pr.head.ref}`));
+    if (ref.object.sha !== pr.head.sha) {
+      return toast('This pull request changed since the page loaded (a new run?). Open Review again and redo your edit.', true);
+    }
+    const catalogue = structuredClone(data.head);
+    const target = catalogue.amiibo.find((other) => other.id === item.id);
+    for (const [path, value] of changes) {
+      if (path.startsWith('release.')) target.release[path.slice(8)] = value;
+      else target[path] = value;
+    }
+    const provenance = structuredClone(data.headProvenance || {});
+    provenance[item.id] ??= {};
+    for (const [path] of changes) {
+      provenance[item.id][path] = { source: 'manual', url: null, retrievedAt: new Date().toISOString(), run: `dashboard:${state.user.login}` };
+    }
+    await commitToBranch(pr.head.ref, pr.head.sha, {
+      files: [
+        { path: 'data/catalogue.json', text: catalogueText(catalogue) },
+        { path: PROVENANCE, text: `${JSON.stringify(provenance, null, 2)}\n` },
+      ],
+      message: `Your values for ${entry.name} (Remote Admin)\n\n${lines.map((line) => `- ${line}`).join('\n')}`,
+    });
+    const note = `Edited in Remote Admin by ${state.user.login}: ${entry.name}\n\n${lines.map((line) => `- ${line}`).join('\n')}${tool?.reports ? `\n\nSaved to ${EDITS}, so ${tool.name} keeps these when it rebuilds this pull request.` : ''}`;
+    await gh(repoPath(`/issues/${pr.number}/comments`), { method: 'POST', body: { body: note } }).catch(() => null);
+  } catch (error) {
+    return toast(`Couldn’t save: ${error.message}`, true);
+  }
+  if (tool?.reports) {
+    try {
+      await writeMetaList(EDITS, (list) => {
+        const current = Array.isArray(list[tool.id]) ? list[tool.id] : [];
+        // A new amiibo by the name and series SNM gives it; an existing one by id.
+        const target = item.kind === 'added' ? { match: snmIdentity(entry, current) } : { id: item.id };
+        const same = (other) => (target.match ? JSON.stringify(other.match) === JSON.stringify(target.match) : other.id === target.id);
+        const name = changes.find(([path]) => path === 'name')?.[1] ?? entry.name;
+        const stamp = { at: new Date().toISOString(), by: state.user.login };
+        list[tool.id] = [
+          ...current.filter((other) => !(same(other) && changes.some(([path]) => path === other.field))),
+          ...changes.map(([field, value]) => ({ name, ...target, field, value, ...stamp })),
+        ];
+      }, `Your values: ${entry.name} (Remote Admin)`);
+    } catch (error) {
+      toast(`Saved in the pull request, but couldn’t save your values for ${tool.name} (${error.message}), so its next run may undo them.`, true);
+      return showTab('review');
+    }
+  }
+  toast(`Saved. The Guard is checking #${pr.number} again; merge when it says Ready.`);
+  showTab('review');
+}
+
+/** A tool's saved values on its page, with Forget. */
+function editsCard(tool, list) {
+  if (!list.length) return null;
+  const valueText = (item) => (item.value === null ? 'empty' : /^release\./.test(item.field) ? appDate(item.value) : item.value);
+  return h('div', { class: 'card stack' },
+    details(`Your values (${list.length})`,
+      h('p', { class: 'small muted' }, `Values you set on ${tool.name}’s pull requests before merging. ${tool.name} applies them whenever it rebuilds its pull request. Once merged they’re in the data, marked as yours, so forgetting them then changes nothing.`),
+      h('ul', { class: 'list' }, list.map((item) =>
+        h('li', { class: 'row spread' },
+          h('div', {}, h('div', {}, `${item.name}: ${fieldLabel(item.field)} = ${valueText(item)}`), h('div', { class: 'small muted' }, `Set ${when(item.at)}${item.by ? ` by ${item.by}` : ''}`)),
+          h('button', {
+            type: 'button',
+            class: 'ghost small',
+            onclick: async () => {
+              try {
+                await writeMetaList(EDITS, (data) => {
+                  const same = JSON.stringify(item);
+                  data[tool.id] = (Array.isArray(data[tool.id]) ? data[tool.id] : []).filter((other) => JSON.stringify(other) !== same);
+                }, `Your values: forget ${item.name} ${item.field} (Remote Admin)`);
+                toast(`Forgotten. If it isn’t merged yet, ${tool.name}’s next run uses its own value again.`);
+                showTab(`tools/${tool.id}`);
+              } catch (error) {
+                toast(`Couldn’t change your values: ${error.message}`, true);
+              }
+            },
+          }, 'Forget'))))));
 }
 
 /** A tool's skip list on its page: what it leaves out, with Allow again. */
@@ -1529,7 +1703,7 @@ function skippedCard(tool, list) {
             class: 'ghost small',
             onclick: async () => {
               try {
-                await writeSkipList((data) => {
+                await writeMetaList(SKIPPED, (data) => {
                   const same = JSON.stringify(item);
                   data[tool.id] = (Array.isArray(data[tool.id]) ? data[tool.id] : []).filter((entry) => JSON.stringify(entry) !== same);
                 }, `Skip list: allow ${item.name} again (Remote Admin)`);
@@ -1733,6 +1907,7 @@ const WHY_TEXT = {
   'replaces a guess': 'replace a value a tool guessed',
   'had no picture': 'add a missing picture',
   'AmiiboAPI and amiibo life agree': 'correct a release date both sources agree on',
+  'your value': 'set to your value',
 };
 
 /** Update Database: how many fields on how many amiibo, and why. */
@@ -1984,6 +2159,7 @@ function addedList(items, prBranch) {
       item.image === 'placeholder' ? 'no picture yet (our icon)' : 'has a picture',
       item.sources?.length ? `from ${joinAnd(item.sources)}` : null,
       item.id.startsWith('ob-') ? `temporary id ${item.id}` : `id ${item.id}`,
+      item.yours?.length ? `your values: ${item.yours.map(fieldLabel).join(', ')}` : null,
     ].filter(Boolean);
     return h('li', { class: 'row top' },
       prBranch ? repoImage(addedImagePath(item), prBranch, item.name) : null,
