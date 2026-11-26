@@ -442,7 +442,7 @@ function signOut() {
 
 // ─── Tabs ───────────────────────────────────────────────────────────
 
-const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, history: showHistory };
+const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, news: showNews, history: showHistory };
 
 function showTab(name, ...args) {
   const [tab, ...rest] = name.split('/');
@@ -1077,7 +1077,10 @@ const SKIPPED = 'meta/skipped.json';
 const EDITS = 'meta/edits.json';
 /** Fields you can set on a pull request before merging (pictures are the tools' job). */
 const PR_EDITABLE = ['name', 'character', 'amiiboSeries', 'gameSeries', 'type', 'release.na', 'release.eu', 'release.jp', 'release.au'];
+const ANNOUNCEMENTS = 'meta/announcements.json';
+
 const ABOUT = {
+  [ANNOUNCEMENTS]: 'Official announcements shown in the app’s News tab, written in Remote Admin. The News workflow folds the active ones into data/news.json.',
   [SKIPPED]: 'What you dropped in Remote Admin. The tools don’t propose these again. To undo one, use Allow again on the tool’s page in Remote Admin.',
   [EDITS]: 'Values you set in Remote Admin on a tool’s pull request before merging. The tools apply them each time they rebuild it. Forget them on the tool’s page in Remote Admin.',
 };
@@ -2813,3 +2816,120 @@ function start() {
   if (hasVault) $('#passphrase').focus();
 }
 start();
+
+
+// ─── News (announcements in the app's News tab) ────────────────────
+
+const NEWS_TITLE_MAX = 200;
+const NEWS_BODY_MAX = 2000;
+
+function announcementState(item, now = Date.now()) {
+  if (item.expiresAt && Date.parse(item.expiresAt) <= now) return ['ended', ''];
+  if (Date.parse(item.publishedAt) > now) return ['scheduled', 'warn'];
+  return ['showing', 'ok'];
+}
+
+/**
+ * The News tab: your announcements (add, end, remove) and the headlines the app shows now.
+ * Saving changes meta/announcements.json on main, which starts the News workflow: the app
+ * has it within about 5 minutes of the next time it checks.
+ */
+async function showNews() {
+  loading('Loading news…');
+  const [{ data }, published] = await Promise.all([
+    readMetaList(ANNOUNCEMENTS),
+    fileJson('data/news.json', 'main').catch(() => null),
+  ]);
+  const items = Array.isArray(data.items) ? data.items : [];
+  const save = async (mutate, message, done) => {
+    try {
+      await writeMetaList(ANNOUNCEMENTS, (file) => {
+        file.items = Array.isArray(file.items) ? file.items : [];
+        mutate(file.items);
+      }, message);
+      toast(`${done} The app shows it after the News update runs (a few minutes).`);
+      showTab('news');
+    } catch (error) {
+      toast(`Couldn’t save: ${error.message}`, true);
+    }
+  };
+
+  const title = h('input', { maxlength: NEWS_TITLE_MAX, placeholder: 'e.g. Data updates paused tonight', autocomplete: 'off' });
+  const body = h('textarea', { rows: 4, maxlength: NEWS_BODY_MAX, placeholder: 'What people should know. Plain text.' });
+  const url = h('input', { placeholder: 'https://… (optional)', autocomplete: 'off', spellcheck: 'false' });
+  const until = h('input', { type: 'date' });
+  const pinned = h('input', { type: 'checkbox' });
+  const counter = h('span', { class: 'small muted' }, `0 / ${NEWS_BODY_MAX}`);
+  body.addEventListener('input', () => { counter.textContent = `${body.value.length} / ${NEWS_BODY_MAX}`; });
+  const post = async () => {
+    const problems = [];
+    if (!title.value.trim()) problems.push('Add a title.');
+    if (!body.value.trim()) problems.push('Add some text.');
+    if (url.value.trim() && !/^https:\/\/\S+$/.test(url.value.trim())) problems.push('The link must start with https://.');
+    const expiresAt = until.value ? new Date(`${until.value}T23:59:59`).toISOString() : null;
+    if (expiresAt && Date.parse(expiresAt) <= Date.now()) problems.push('“Show until” must be in the future.');
+    if (problems.length) return toast(problems.join(' '), true);
+    const item = {
+      id: `${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 8)}`,
+      title: title.value.trim(),
+      body: body.value.trim(),
+      url: url.value.trim() || null,
+      publishedAt: new Date().toISOString(),
+      expiresAt,
+      pinned: pinned.checked,
+    };
+    if (!(await confirmDialog('Post this announcement?', [h('strong', {}, item.title), item.body, item.url ? link(item.url, item.url) : null].filter(Boolean), 'Post'))) return;
+    await save((list) => list.push(item), `News: ${item.title} (Remote Admin)`, 'Posted.');
+  };
+
+  const rows = [...items].sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt))).map((item) => {
+    const [state, kind] = announcementState(item);
+    return h('li', { class: 'stack' },
+      h('div', { class: 'row spread' },
+        h('div', {},
+          h('strong', {}, item.title), ' ', pill(state, kind), item.pinned ? pill('pinned') : null,
+          h('div', { class: 'small muted' }, `Posted ${when(item.publishedAt)}${item.expiresAt ? ` · shows until ${when(item.expiresAt)}` : ''}`)),
+        h('div', { class: 'row' },
+          state === 'showing' ? h('button', {
+            type: 'button',
+            class: 'ghost small',
+            onclick: async () => {
+              if (!(await confirmDialog('End this announcement?', 'It disappears from the app at the next News update. It stays listed here.', 'End it'))) return;
+              save((list) => { const target = list.find((other) => other.id === item.id); if (target) target.expiresAt = new Date().toISOString(); }, `News: end ${item.title} (Remote Admin)`, 'Ended.');
+            },
+          }, 'End now') : null,
+          h('button', {
+            type: 'button',
+            class: 'ghost small danger',
+            onclick: async () => {
+              if (!(await confirmDialog('Remove this announcement?', 'It’s deleted from the list and disappears from the app at the next News update.', 'Remove', true))) return;
+              save((list) => { const at = list.findIndex((other) => other.id === item.id); if (at >= 0) list.splice(at, 1); }, `News: remove ${item.title} (Remote Admin)`, 'Removed.');
+            },
+          }, 'Remove'))),
+      h('p', { class: 'small' }, item.body),
+      item.url ? h('div', { class: 'small' }, link(item.url, item.url)) : null);
+  });
+
+  const headlines = (published?.items || []).filter((item) => item.kind === 'article');
+  view(
+    h('div', { class: 'card stack' },
+      h('h2', {}, 'Post an announcement'),
+      h('p', { class: 'small muted' }, 'Shown in the app’s News tab as “From Amiibo Companion”: maintenance, changes, disclosures. Plain text only. Pinned ones stay at the top.'),
+      h('label', {}, 'Title', title),
+      h('label', {}, 'Text', body, counter),
+      h('label', {}, 'Link (optional)', url),
+      h('div', { class: 'row' },
+        h('label', {}, 'Show until (optional)', until),
+        h('label', { class: 'check' }, pinned, 'Pin to the top')),
+      h('div', { class: 'row' }, h('button', { type: 'button', onclick: post }, 'Post'))),
+    h('div', { class: 'card stack' },
+      h('h2', {}, `Your announcements (${items.length})`),
+      items.length ? h('ul', { class: 'list' }, rows) : h('p', { class: 'muted' }, 'None yet.')),
+    h('div', { class: 'card stack' },
+      h('h2', {}, `Headlines in the app (${headlines.length})`),
+      h('p', { class: 'small muted' }, 'amiibo stories from Nintendo Life and My Nintendo News, checked every 3 hours. The app shows the title, site and date, and opens the story on the site.'),
+      headlines.length
+        ? h('ul', { class: 'list small' }, headlines.slice(0, 30).map((item) => h('li', {}, link(item.title, item.url), h('span', { class: 'muted' }, ` · ${item.source} · ${when(item.publishedAt)}`))))
+        : h('p', { class: 'muted' }, 'None yet.')),
+  );
+}
