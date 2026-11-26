@@ -1297,9 +1297,15 @@ async function rollBack(commit, undone) {
 
 // ─── Start ──────────────────────────────────────────────────────────
 
+/** Shorter passphrases can be guessed offline from a copied vault, even with PBKDF2. */
+const MIN_PASSPHRASE = 12;
+
 function start() {
-  // Refuse to run inside another site's frame (it could trick clicks such as Merge).
-  if (window.top !== window.self) {
+  // Refuse to run inside a frame (another site could trick clicks such as Merge) or in a
+  // window another page opened: that page keeps a handle on this one and, if it's on
+  // oddbolt.github.io too, could read the token after you unlock. Links opened in a new
+  // tab don't count (browsers open them without that handle).
+  if (window.top !== window.self || window.opener) {
     $('#framed').hidden = false;
     return;
   }
@@ -1321,7 +1327,7 @@ function start() {
     $('#signin-error').textContent = '';
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return ($('#signin-error').textContent = 'Enter the repository as owner/name.');
     if (!token) return ($('#signin-error').textContent = 'Enter a token.');
-    if (remember && passphrase.length < 8) return ($('#signin-error').textContent = 'Choose a passphrase of at least 8 characters.');
+    if (remember && passphrase.length < MIN_PASSPHRASE) return ($('#signin-error').textContent = `Choose a passphrase of at least ${MIN_PASSPHRASE} characters (a few words works well).`);
     try {
       await signIn(token, repo);
       if (remember) await saveVault(token, passphrase);
@@ -1339,9 +1345,13 @@ function start() {
     $('#unlock-error').textContent = '';
     $('#unlock-button').disabled = true;
     try {
-      const token = await openVault($('#passphrase').value);
+      const passphrase = $('#passphrase').value;
+      const token = await openVault(passphrase);
       $('#passphrase').value = '';
       await signIn(token, storage('local')?.getItem('admin.repo') || '');
+      if (passphrase.length < MIN_PASSPHRASE) {
+        toast(`Your passphrase is under ${MIN_PASSPHRASE} characters, which can be guessed offline. Sign out, then sign in with “Remember” and a longer one.`, true);
+      }
     } catch (error) {
       state.token = '';
       $('#unlock-error').textContent = error.status === 401 ? 'GitHub rejected the saved token (expired?). Use a different token.' : String(error.message || error);

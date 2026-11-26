@@ -40,7 +40,7 @@ sitemap: false
     <label>Data repository <input id="repo" autocomplete="off" spellcheck="false" placeholder="owner/name"></label>
     <label>Token <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
     <label class="check"><input id="remember" type="checkbox"> Remember on this device (encrypted)</label>
-    <label id="new-passphrase-row" hidden>Passphrase to unlock it next time (8+ characters)
+    <label id="new-passphrase-row" hidden>Passphrase to unlock it next time (12+ characters; a few words works well)
       <input id="new-passphrase" type="password" autocomplete="new-password" spellcheck="false"></label>
     <button type="button" id="signin-button">Sign in</button>
     <p id="signin-error" class="error" role="alert"></p>
@@ -57,7 +57,7 @@ sitemap: false
   </section>
   <section id="framed" class="card narrow" hidden>
     <h2>Open this page directly</h2>
-    <p class="muted">For your safety, Remote Admin doesn’t work inside another site.</p>
+    <p class="muted">For your safety, Remote Admin doesn’t run inside another page or in a window another page opened. Type the address or use a bookmark.</p>
   </section>
   <div id="view"></div>
 </main>
