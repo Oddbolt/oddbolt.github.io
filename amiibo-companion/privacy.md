@@ -7,7 +7,7 @@ permalink: /amiibo-companion/privacy.html
 
 **Amiibo Companion for Android**<br>
 Developer: Oddbolt<br>
-Effective date: November 26, 2026<br>
+Effective date: November 27, 2026<br>
 Download: [PDF copy](/amiibo-companion/privacy.pdf)
 
 ## 1. Introduction
@@ -32,8 +32,9 @@ The App stores the following information only on your device, in storage that is
 
 - The amiibo you mark as owned and the details you add to each copy, such as packaging, condition, purchase date, price paid, notes, and copy names;
 - Your wishlist and its priorities;
-- Photos you attach to a copy;
-- Your settings, such as theme and completion preferences;
+- Photos you attach to a copy (resized on your device to save space);
+- Your settings, such as theme, completion, and reminder preferences;
+- Release-day reminders, if you turn them on: scheduled on your device from your wishlist;
 - Downloaded copies of the amiibo catalogue, store links, images, and news.
 
 This information is not transmitted to us or to any third party by the App.
@@ -46,6 +47,7 @@ This information is not transmitted to us or to any third party by the App.
 | --- | --- | --- |
 | Camera | Only when you choose to take a photo of a copy | Saved in the App's private storage on your device. Never uploaded. |
 | Photos (system photo picker) | Only when you choose existing photos | Copied into the App's private storage on your device. Never uploaded. |
+| Notifications | Only if you turn on release-day reminders | Reminders are created and shown on your device. The App does not use push notifications and sends nothing to us or anyone else. |
 
 You can withdraw these permissions at any time in your device settings. The rest of the App continues to work without them.
 
@@ -88,9 +90,11 @@ When you turn the feature off, the App stops sending statistics immediately and 
 
 Some store links may be affiliate links. If you make a purchase after tapping one, the retailer may pay us a commission at no extra cost to you. Any tracking is performed by the retailer or the affiliate program on its own website or app. The App does not send them your personal information.
 
-## 9. Files you export or share
+## 9. Files you export, share, or import
 
 When you export a backup or a spreadsheet (CSV), the App creates a file and opens your device's share sheet. You decide where the file goes, for example Google Drive or Files, and that service's privacy policy applies. Backup files contain your collection, wishlist, settings, and photos; spreadsheet files contain your collection and wishlist.
+
+When you import a list, the App reads the text you paste or the file you pick on your device to match amiibo names. The list is not uploaded or kept after the import.
 
 ## 10. Information you send us
 
