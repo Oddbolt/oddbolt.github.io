@@ -442,7 +442,7 @@ function signOut() {
 
 // ─── Tabs ───────────────────────────────────────────────────────────
 
-const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, news: showNews, history: showHistory };
+const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, news: showNews, banner: showBanner, history: showHistory };
 
 function showTab(name, ...args) {
   const [tab, ...rest] = name.split('/');
@@ -2931,5 +2931,249 @@ async function showNews() {
       headlines.length
         ? h('ul', { class: 'list small' }, headlines.slice(0, 30).map((item) => h('li', {}, link(item.title, item.url), h('span', { class: 'muted' }, ` · ${item.source} · ${when(item.publishedAt)}`))))
         : h('p', { class: 'muted' }, 'None yet.')),
+  );
+}
+
+// ─── Banner (the message banner at the top of the app) ────────────────
+
+const BANNER_FILE = 'data/banner.json';
+const LIVE_BANNER_URL = 'https://oddbolt.github.io/amiibo-cdn/data/banner.json';
+const BANNER_LIMITS = { title: 60, message: 280, linkLabel: 24 };
+/** The icon's ray colours, plus your own with Custom. */
+const BANNER_COLORS = [
+  ['Blue', '#009FE3'],
+  ['Green', '#00965E'],
+  ['Lime', '#8CC63F'],
+  ['Yellow', '#F5A800'],
+  ['Red', '#E4002B'],
+  ['Grey', '#3A3F4B'],
+];
+const HEX = /^#[0-9a-fA-F]{6}$/;
+
+/** WCAG contrast between two #RRGGBB colours, same maths as the app (src/banner/color.ts). */
+function contrastRatio(a, b) {
+  const lum = (hex) => {
+    const c = (i) => {
+      const v = parseInt(hex.slice(i, i + 2), 16) / 255;
+      return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * c(1) + 0.7152 * c(3) + 0.0722 * c(5);
+  };
+  const [light, dark] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+/** Black or white text, whichever the app will use on this colour. */
+const bannerTextColor = (hex) => (contrastRatio(hex, '#0E1014') >= contrastRatio(hex, '#FFFFFF') ? '#0E1014' : '#FFFFFF');
+
+function bannerState(banner, now = Date.now()) {
+  if (banner.endsAt && Date.parse(banner.endsAt) <= now) return ['ended', ''];
+  if (banner.startsAt && Date.parse(banner.startsAt) > now) return ['scheduled', 'warn'];
+  return ['showing', 'ok'];
+}
+
+/** The banner as the app draws it (colour, black or white text, link, close button). */
+function bannerPreview(banner) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'bp-icon');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02z');
+  path.setAttribute('fill', 'currentColor');
+  svg.append(path);
+  const el = h('div', { class: 'banner-preview' },
+    svg,
+    h('div', { class: 'bp-text' },
+      h('strong', {}, banner.title || 'Title'),
+      banner.message ? h('p', {}, banner.message) : null,
+      banner.link ? h('span', { class: 'bp-link' }, `${banner.linkLabel || 'Learn more'} ›`) : null),
+    banner.dismissible ? h('span', { class: 'bp-close', 'aria-label': 'Close button' }, '×') : null);
+  const color = HEX.test(banner.color) ? banner.color : '#3A3F4B';
+  el.style.backgroundColor = color;
+  el.style.color = bannerTextColor(color);
+  return el;
+}
+
+/** "2026-11-28T21:30" for a datetime-local field, in this computer's time zone. */
+function toLocalInput(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function readBannerFile() {
+  try {
+    const meta = await gh(repoPath(`/contents/${BANNER_FILE}?ref=main`));
+    return { sha: meta.sha, data: JSON.parse(base64ToUtf8(meta.content)) };
+  } catch (error) {
+    if (error.status === 404) return { sha: null, data: { banner: null } };
+    throw error;
+  }
+}
+
+/**
+ * Writes data/banner.json straight on main (one notice, nothing to review); the push starts
+ * Publish, which checks it and puts it online. Retries once if it changed meanwhile.
+ */
+async function writeBannerFile(banner, message) {
+  for (let attempt = 0; ; attempt++) {
+    const { sha } = await readBannerFile();
+    try {
+      await gh(repoPath(`/contents/${BANNER_FILE}`), {
+        method: 'PUT',
+        body: { message, content: utf8ToBase64(`${JSON.stringify({ banner }, null, 2)}\n`), branch: 'main', ...(sha ? { sha } : {}) },
+      });
+      return;
+    } catch (error) {
+      if (attempt >= 1 || ![409, 422].includes(error.status)) throw error;
+    }
+  }
+}
+
+/**
+ * The Banner tab: the short notice at the top of every app screen except Settings
+ * (maintenance, warnings). Not news: longer posts go in the News tab.
+ */
+async function showBanner() {
+  loading('Loading banner…');
+  const [{ data }, live] = await Promise.all([
+    readBannerFile(),
+    fetch(LIVE_BANNER_URL, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+  ]);
+  const saved = data.banner ?? null;
+  const online = live?.banner ?? null;
+  const start = saved ?? { title: '', message: '', color: BANNER_COLORS[0][1], link: null, linkLabel: null, dismissible: true, startsAt: null, endsAt: null };
+
+  const title = h('input', { maxlength: BANNER_LIMITS.title, value: start.title, placeholder: 'e.g. Maintenance tonight', autocomplete: 'off' });
+  const message = h('textarea', { rows: 3, maxlength: BANNER_LIMITS.message, placeholder: 'One or two short sentences (optional).' });
+  message.value = start.message;
+  const linkInput = h('input', { value: start.link ?? '', placeholder: 'https://… (optional)', autocomplete: 'off', spellcheck: 'false' });
+  const linkLabel = h('input', { maxlength: BANNER_LIMITS.linkLabel, value: start.linkLabel ?? '', placeholder: 'Learn more', autocomplete: 'off' });
+  const dismissible = h('input', { type: 'checkbox' });
+  dismissible.checked = start.dismissible;
+  const startsAt = h('input', { type: 'datetime-local', value: toLocalInput(start.startsAt) });
+  const endsAt = h('input', { type: 'datetime-local', value: toLocalInput(start.endsAt) });
+  let color = start.color;
+  const picker = h('input', { type: 'color', value: color.toLowerCase(), 'aria-label': 'Custom colour' });
+  const hex = h('input', { value: color.toUpperCase(), maxlength: 7, class: 'hex', spellcheck: 'false', 'aria-label': 'Colour code' });
+  const titleCount = h('span', { class: 'small muted' });
+  const messageCount = h('span', { class: 'small muted' });
+  const previewBox = h('div', {});
+  const readability = h('p', { class: 'small' });
+
+  const swatches = BANNER_COLORS.map(([name, value]) => {
+    const swatch = h('button', { type: 'button', class: 'swatch', title: name, 'aria-label': name, onclick: () => setColor(value) });
+    swatch.style.backgroundColor = value;
+    swatch.dataset.color = value;
+    return swatch;
+  });
+
+  const current = () => ({
+    title: title.value.trim(),
+    message: message.value.trim(),
+    color,
+    link: linkInput.value.trim() || null,
+    linkLabel: linkInput.value.trim() && linkLabel.value.trim() ? linkLabel.value.trim() : null,
+    dismissible: dismissible.checked,
+    startsAt: startsAt.value ? new Date(startsAt.value).toISOString() : null,
+    endsAt: endsAt.value ? new Date(endsAt.value).toISOString() : null,
+  });
+
+  const refresh = () => {
+    titleCount.textContent = `${title.value.length} / ${BANNER_LIMITS.title}`;
+    messageCount.textContent = `${message.value.length} / ${BANNER_LIMITS.message}`;
+    for (const swatch of swatches) swatch.classList.toggle('selected', swatch.dataset.color.toLowerCase() === color.toLowerCase());
+    previewBox.replaceChildren(bannerPreview(current()));
+    const ratio = contrastRatio(color, bannerTextColor(color));
+    readability.textContent = ratio >= 4.5
+      ? `Easy to read (contrast ${ratio.toFixed(1)}:1).`
+      : `Hard to read on this colour (contrast ${ratio.toFixed(1)}:1, aim for 4.5). Pick a darker or lighter shade.`;
+    readability.className = `small ${ratio >= 4.5 ? 'muted' : 'error'}`;
+  };
+  function setColor(value) {
+    color = value.toUpperCase();
+    picker.value = color.toLowerCase();
+    hex.value = color;
+    refresh();
+  }
+  picker.addEventListener('input', () => setColor(picker.value));
+  hex.addEventListener('input', () => {
+    const value = hex.value.trim().startsWith('#') ? hex.value.trim() : `#${hex.value.trim()}`;
+    if (HEX.test(value)) setColor(value);
+  });
+  for (const field of [title, message, linkInput, linkLabel, dismissible, startsAt, endsAt]) field.addEventListener('input', refresh);
+  refresh();
+
+  const post = async () => {
+    const banner = current();
+    const problems = [];
+    if (!banner.title) problems.push('Add a title.');
+    if (!HEX.test(banner.color)) problems.push('Pick a colour.');
+    if (banner.link && !/^https:\/\/\S+$/.test(banner.link)) problems.push('The link must start with https://.');
+    if (banner.endsAt && Date.parse(banner.endsAt) <= Date.now()) problems.push('“Ends” must be in the future.');
+    if (banner.startsAt && banner.endsAt && Date.parse(banner.endsAt) <= Date.parse(banner.startsAt)) problems.push('“Ends” must be after “Starts”.');
+    if (problems.length) return toast(problems.join(' '), true);
+    // A new id every time: everyone sees it, even people who closed the previous banner.
+    const posted = { id: `b-${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 8)}`, ...banner };
+    const when_ = [posted.startsAt ? `Starts ${when(posted.startsAt)}.` : 'Shows right away.', posted.endsAt ? `Ends ${when(posted.endsAt)}.` : 'Stays until you remove it.'].join(' ');
+    if (!(await confirmDialog(saved ? 'Replace the banner?' : 'Post this banner?', [bannerPreview(posted), when_, 'Everyone sees it, including people who closed the previous banner.'], saved ? 'Replace' : 'Post'))) return;
+    try {
+      await writeBannerFile(posted, `Banner: ${posted.title} (Remote Admin)`);
+      toast('Saved. It’s online in about a minute; phones pick it up within 10–20 minutes.');
+      showTab('banner');
+    } catch (error) {
+      toast(`Couldn’t save: ${error.message}`, true);
+    }
+  };
+
+  const remove = async () => {
+    if (!(await confirmDialog('Remove the banner?', 'It disappears from the app the next time phones check (within 10–20 minutes).', 'Remove', true))) return;
+    try {
+      await writeBannerFile(null, 'Banner: removed (Remote Admin)');
+      toast('Removed. Phones drop it within 10–20 minutes.');
+      showTab('banner');
+    } catch (error) {
+      toast(`Couldn’t save: ${error.message}`, true);
+    }
+  };
+
+  let status;
+  if (!saved) status = h('p', { class: 'muted' }, 'No banner. The app shows nothing.');
+  else {
+    const [stateText, kind] = bannerState(saved);
+    const isOnline = online?.id === saved.id;
+    status = h('div', { class: 'stack' },
+      h('div', { class: 'row' }, pill(stateText, kind), pill(isOnline ? 'online' : 'publishing…', isOnline ? 'ok' : 'warn'),
+        h('span', { class: 'small muted' }, [saved.startsAt ? `from ${when(saved.startsAt)}` : null, saved.endsAt ? `until ${when(saved.endsAt)}` : 'until you remove it'].filter(Boolean).join(' · '))),
+      bannerPreview(saved),
+      isOnline ? null : h('p', { class: 'small muted' }, 'Saved, not online yet: Publish takes about a minute, and the site caches files for up to 10 minutes. Reload this tab to check again.'),
+      h('div', { class: 'row' }, h('button', { type: 'button', class: 'ghost danger', onclick: remove }, 'Remove banner')));
+  }
+
+  view(
+    h('div', { class: 'card stack' },
+      h('h2', {}, 'Current banner'),
+      h('p', { class: 'small muted' }, 'Shown at the top of every screen in the app except Settings. For short notices (maintenance, warnings); longer posts belong in News.'),
+      status),
+    h('div', { class: 'card stack' },
+      h('h2', {}, saved ? 'Change the banner' : 'Post a banner'),
+      h('label', {}, 'Title', title, titleCount),
+      h('label', {}, 'Message', message, messageCount),
+      h('div', { class: 'stack' },
+        h('span', { class: 'label' }, 'Colour'),
+        h('div', { class: 'swatches' }, swatches, h('span', { class: 'small muted' }, 'Custom'), picker, hex),
+        readability),
+      h('div', { class: 'pair' },
+        h('label', {}, 'Link (optional)', linkInput),
+        h('label', {}, 'Link text', linkLabel)),
+      h('div', { class: 'pair' },
+        h('label', {}, 'Starts (optional, your time)', startsAt),
+        h('label', {}, 'Ends (optional, your time)', endsAt)),
+      h('label', { class: 'check' }, dismissible, 'People can close it (turn off for notices everyone must see)'),
+      h('span', { class: 'label' }, 'Preview'),
+      previewBox,
+      h('div', { class: 'row' }, h('button', { type: 'button', onclick: post }, saved ? 'Replace banner' : 'Post banner'))),
   );
 }
