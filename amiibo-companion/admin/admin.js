@@ -2927,7 +2927,7 @@ async function showNews() {
       items.length ? h('ul', { class: 'list' }, rows) : h('p', { class: 'muted' }, 'None yet.')),
     h('div', { class: 'card stack' },
       h('h2', {}, `Headlines in the app (${headlines.length})`),
-      h('p', { class: 'small muted' }, 'amiibo stories from Nintendo Life and My Nintendo News, checked every 3 hours. The app shows the title, site and date, and opens the story on the site.'),
+      h('p', { class: 'small muted' }, 'amiibo stories from Nintendo Life and Nintendo’s UK news feed, checked every 3 hours. The app shows the title, site and date, and opens the story on the site.'),
       headlines.length
         ? h('ul', { class: 'list small' }, headlines.slice(0, 30).map((item) => h('li', {}, link(item.title, item.url), h('span', { class: 'muted' }, ` · ${item.source} · ${when(item.publishedAt)}`))))
         : h('p', { class: 'muted' }, 'None yet.')),
