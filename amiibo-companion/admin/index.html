@@ -9,7 +9,7 @@ sitemap: false
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: https://oddbolt.github.io https://assets.nintendo.com https://raw.githubusercontent.com https://avatars.githubusercontent.com; connect-src https://api.github.com https://raw.githubusercontent.com https://oddbolt.github.io; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: https://oddbolt.github.io https://assets.nintendo.com https://www.nintendo.com https://raw.githubusercontent.com https://avatars.githubusercontent.com; connect-src https://api.github.com https://raw.githubusercontent.com https://oddbolt.github.io; base-uri 'none'; form-action 'none'">
 <title>Remote Admin · Amiibo Companion</title>
 <link rel="icon" href="icon.png">
 <link rel="stylesheet" href="admin.css">
@@ -28,6 +28,7 @@ sitemap: false
     <button type="button" data-tab="tools">Tools</button>
     <button type="button" data-tab="review">Review</button>
     <button type="button" data-tab="catalogue">Catalogue</button>
+    <button type="button" data-tab="links">Links</button>
     <button type="button" data-tab="news">News</button>
     <button type="button" data-tab="banner">Banner</button>
     <button type="button" data-tab="history">History</button>
@@ -41,6 +42,7 @@ sitemap: false
     <p class="muted">Use a GitHub fine-grained personal access token limited to the data repository. Nothing is sent anywhere except GitHub.</p>
     <label>Data repository <input id="repo" autocomplete="off" spellcheck="false" placeholder="owner/name"></label>
     <label>Token <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
+    <label>Token expires on (optional, shown on GitHub’s token page) <input id="token-expires" type="date"></label>
     <label class="check"><input id="remember" type="checkbox"> Remember on this device (encrypted)</label>
     <label id="new-passphrase-row" hidden>Passphrase to unlock it next time (12+ characters; a few words works well)
       <input id="new-passphrase" type="password" autocomplete="new-password" spellcheck="false"></label>

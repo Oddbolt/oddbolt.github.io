@@ -209,6 +209,7 @@ async function gh(path, options = {}) {
     } catch {
       // Keep the status text.
     }
+    if (response.status === 401) message = 'GitHub rejected the token: it has expired or was deleted. Sign out and sign in with a new one.';
     const error = new Error(message);
     error.status = response.status;
     throw error;
@@ -402,6 +403,47 @@ function forgetVault() {
   storage('local')?.removeItem(VAULT_KEY);
 }
 
+// The token's expiry date. GitHub sends it in a response header that browsers aren't allowed
+// to read (not in Access-Control-Expose-Headers), so you type it once from GitHub's token page.
+const EXPIRY_KEY = 'admin.tokenExpires';
+const EXPIRY_WARN_DAYS = 14;
+const TOKEN_PAGE = 'https://github.com/settings/personal-access-tokens';
+
+function tokenExpiry() {
+  const value = storage('local')?.getItem(EXPIRY_KEY) || '';
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+}
+
+function setTokenExpiry(value) {
+  if (value && /^\d{4}-\d{2}-\d{2}$/.test(value)) storage('local')?.setItem(EXPIRY_KEY, value);
+  else storage('local')?.removeItem(EXPIRY_KEY);
+}
+
+function daysUntil(date) {
+  const today = new Date();
+  const start = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
+  const [y, m, d] = date.split('-').map(Number);
+  return Math.round((Date.UTC(y, m - 1, d) - start) / 86400000);
+}
+
+/** Home's token card: a warning in the last 14 days, a prompt when the date isn't set, else nothing. */
+function tokenExpiryCard() {
+  const date = tokenExpiry();
+  const input = h('input', { type: 'date', value: date || '', class: 'inline-date' });
+  const save = h('button', { type: 'button', class: 'ghost small', onclick: () => { setTokenExpiry(input.value); showTab('home'); } }, 'Save');
+  const how = h('span', { class: 'small muted' }, 'GitHub: your avatar > Settings > Developer settings > Personal access tokens > Fine-grained tokens shows “Expires on”. ', link('Open', TOKEN_PAGE));
+  if (!date) {
+    return h('div', { class: 'banner is-warn' }, h('strong', {}, 'When does your token expire?'), ' Set the date so Home can warn you two weeks ahead.',
+      h('div', { class: 'row' }, input, save), how);
+  }
+  const days = daysUntil(date);
+  if (days > EXPIRY_WARN_DAYS) return null;
+  const title = days < 0 ? 'Your token has expired.' : days === 0 ? 'Your token expires today.' : `Your token expires in ${plural(days, 'day')}.`;
+  return h('div', { class: `banner is-${days <= 3 ? 'error' : 'warn'}` }, h('strong', {}, title),
+    ' Make a new one with the same repository and permissions (Actions, Contents, Issues, Pull requests: read and write; 90 days), sign out here, sign in with it and set the new date. Then delete the old token on GitHub.',
+    h('div', { class: 'row' }, input, save), how);
+}
+
 async function signIn(token, repo) {
   state.token = token;
   state.repo = repo;
@@ -434,6 +476,7 @@ function startIdleLock() {
 
 function signOut() {
   forgetVault();
+  setTokenExpiry(null);
   state.token = '';
   state.catalogue = null;
   location.hash = '';
@@ -442,7 +485,7 @@ function signOut() {
 
 // ─── Tabs ───────────────────────────────────────────────────────────
 
-const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, news: showNews, banner: showBanner, history: showHistory };
+const TABS = { home: showHome, tools: showTools, review: showReview, catalogue: showCatalogue, links: showLinks, news: showNews, banner: showBanner, history: showHistory };
 
 function showTab(name, ...args) {
   const [tab, ...rest] = name.split('/');
@@ -558,6 +601,7 @@ async function showHome() {
   };
 
   view(
+    tokenExpiryCard(),
     h('div', { class: 'grid' },
       stat('Published amiibo', published ? String(published.amiibo.length) : '?', published ? `Data from ${when(published.generatedAt)}` : 'Couldn’t read the public data'),
       stat('Waiting for review', String(pulls.length), pulls.length ? 'See Review' : 'Nothing to merge'),
@@ -870,6 +914,21 @@ async function reviewCard(pr) {
     update();
   } else if (data?.error) {
     card.append(h('p', { class: 'warn' }, `Couldn’t compare the changes: ${data.error.message}`));
+  }
+  if (files.some((file) => file.filename === LINKS_FILE)) {
+    try {
+      const rows = await prLinkChanges(pr);
+      const n = (kind) => rows.filter((row) => row.kind === kind).length;
+      const parts = [['added', 'new'], ['changed', 'changed'], ['removed', 'removed']].filter(([kind]) => n(kind)).map(([kind, word]) => `${n(kind)} ${word}`);
+      card.append(h('h3', {}, `Store links: ${parts.join(', ') || 'no link changes'}`));
+      if (rows.length) {
+        card.append(
+          h('p', { class: 'small muted' }, 'Open each link to check it’s the official Nintendo product at that store, then merge.'),
+          linkChangesView(rows));
+      }
+    } catch (error) {
+      card.append(h('p', { class: 'warn' }, `Couldn’t compare the store links: ${error.message}`));
+    }
   }
   if (tool?.reports && report) {
     const omit = data && !data.error ? [tool.main, 'promoted', 'filled'] : [];
@@ -2771,6 +2830,7 @@ function start() {
     try {
       await signIn(token, repo);
       if (remember) await saveVault(token, passphrase);
+      if ($('#token-expires').value) setTokenExpiry($('#token-expires').value);
       $('#token').value = '';
       $('#new-passphrase').value = '';
     } catch (error) {
@@ -2789,6 +2849,8 @@ function start() {
       const token = await openVault(passphrase);
       $('#passphrase').value = '';
       await signIn(token, storage('local')?.getItem('admin.repo') || '');
+      const expires = tokenExpiry();
+      if (expires && daysUntil(expires) <= EXPIRY_WARN_DAYS) toast(daysUntil(expires) < 0 ? 'Your token has expired: see Home.' : `Your token expires in ${plural(daysUntil(expires), 'day')}: see Home.`, true);
       if (passphrase.length < MIN_PASSPHRASE) {
         toast(`Your passphrase is under ${MIN_PASSPHRASE} characters, which can be guessed offline. Sign out, then sign in with “Remember” and a longer one.`, true);
       }
@@ -2822,6 +2884,17 @@ start();
 
 const NEWS_TITLE_MAX = 200;
 const NEWS_BODY_MAX = 2000;
+
+/**
+ * When the News workflow next runs at or after `time` (it runs every 3 hours at :41 UTC, and
+ * when you save here). A scheduled announcement appears, and one with an end date leaves, then.
+ */
+function nextNewsUpdate(time) {
+  const at = new Date(time);
+  const next = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), Math.floor(at.getUTCHours() / 3) * 3, 41));
+  while (next.getTime() < at.getTime()) next.setUTCHours(next.getUTCHours() + 3);
+  return next.toISOString();
+}
 
 function announcementState(item, now = Date.now()) {
   if (item.expiresAt && Date.parse(item.expiresAt) <= now) return ['ended', ''];
@@ -2857,6 +2930,7 @@ async function showNews() {
   const title = h('input', { maxlength: NEWS_TITLE_MAX, placeholder: 'e.g. Data updates paused tonight', autocomplete: 'off' });
   const body = h('textarea', { rows: 4, maxlength: NEWS_BODY_MAX, placeholder: 'What people should know. Plain text.' });
   const url = h('input', { placeholder: 'https://… (optional)', autocomplete: 'off', spellcheck: 'false' });
+  const from = h('input', { type: 'datetime-local' });
   const until = h('input', { type: 'date' });
   const pinned = h('input', { type: 'checkbox' });
   const counter = h('span', { class: 'small muted' }, `0 / ${NEWS_BODY_MAX}`);
@@ -2867,19 +2941,25 @@ async function showNews() {
     if (!body.value.trim()) problems.push('Add some text.');
     if (url.value.trim() && !/^https:\/\/\S+$/.test(url.value.trim())) problems.push('The link must start with https://.');
     const expiresAt = until.value ? new Date(`${until.value}T23:59:59`).toISOString() : null;
+    const startsAt = from.value ? new Date(from.value).toISOString() : null;
+    if (startsAt && Date.parse(startsAt) <= Date.now()) problems.push('“Show from” must be in the future (leave it empty to post now).');
     if (expiresAt && Date.parse(expiresAt) <= Date.now()) problems.push('“Show until” must be in the future.');
+    if (startsAt && expiresAt && Date.parse(expiresAt) <= Date.parse(startsAt)) problems.push('“Show until” must be after “Show from”.');
     if (problems.length) return toast(problems.join(' '), true);
     const item = {
       id: `${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 8)}`,
       title: title.value.trim(),
       body: body.value.trim(),
       url: url.value.trim() || null,
-      publishedAt: new Date().toISOString(),
+      publishedAt: startsAt || new Date().toISOString(),
       expiresAt,
       pinned: pinned.checked,
     };
-    if (!(await confirmDialog('Post this announcement?', [h('strong', {}, item.title), item.body, item.url ? link(item.url, item.url) : null].filter(Boolean), 'Post'))) return;
-    await save((list) => list.push(item), `News: ${item.title} (Remote Admin)`, 'Posted.');
+    const timing = startsAt
+      ? `Scheduled: it appears in the app at the first News update after ${when(startsAt)}, around ${when(nextNewsUpdate(startsAt))}.`
+      : 'It appears in the app within a few minutes.';
+    if (!(await confirmDialog(startsAt ? 'Schedule this announcement?' : 'Post this announcement?', [h('strong', {}, item.title), item.body, item.url ? link(item.url, item.url) : null, h('p', { class: 'small muted' }, timing)].filter(Boolean), startsAt ? 'Schedule' : 'Post'))) return;
+    await save((list) => list.push(item), `News: ${startsAt ? 'schedule' : ''}${startsAt ? ' ' : ''}${item.title} (Remote Admin)`, startsAt ? 'Scheduled.' : 'Posted.');
   };
 
   const rows = [...items].sort((a, b) => String(b.publishedAt).localeCompare(String(a.publishedAt))).map((item) => {
@@ -2888,7 +2968,9 @@ async function showNews() {
       h('div', { class: 'row spread' },
         h('div', {},
           h('strong', {}, item.title), ' ', pill(state, kind), item.pinned ? pill('pinned') : null,
-          h('div', { class: 'small muted' }, `Posted ${when(item.publishedAt)}${item.expiresAt ? ` · shows until ${when(item.expiresAt)}` : ''}`)),
+          h('div', { class: 'small muted' }, state === 'scheduled'
+            ? `Starts ${when(item.publishedAt)} (in the app around ${when(nextNewsUpdate(item.publishedAt))})${item.expiresAt ? ` · shows until ${when(item.expiresAt)}` : ''}`
+            : `Posted ${when(item.publishedAt)}${item.expiresAt ? ` · shows until ${when(item.expiresAt)}` : ''}`)),
         h('div', { class: 'row' },
           state === 'showing' ? h('button', {
             type: 'button',
@@ -2919,8 +3001,10 @@ async function showNews() {
       h('label', {}, 'Text', body, counter),
       h('label', {}, 'Link (optional)', url),
       h('div', { class: 'row' },
+        h('label', {}, 'Show from (optional, your time)', from),
         h('label', {}, 'Show until (optional)', until),
         h('label', { class: 'check' }, pinned, 'Pin to the top')),
+      h('p', { class: 'small muted' }, 'Leave “Show from” empty to post now. A scheduled one appears at the first News update after that time: updates run every 3 hours, so it can be up to 3 hours late. Ends work the same way.'),
       h('div', { class: 'row' }, h('button', { type: 'button', onclick: post }, 'Post'))),
     h('div', { class: 'card stack' },
       h('h2', {}, `Your announcements (${items.length})`),
@@ -3176,4 +3260,334 @@ async function showBanner() {
       previewBox,
       h('div', { class: 'row' }, h('button', { type: 'button', onclick: post }, saved ? 'Replace banner' : 'Post banner'))),
   );
+}
+
+// ─── Links (store links: data/links.json) ───────────────────────────
+
+const LINKS_FILE = 'data/links.json';
+/** Same lists as RETAILER_HOSTS in amiibo-data's data-schema.mts and the app's links.ts. */
+const RETAILER_HOSTS = { amazon: ['amazon.com', 'amzn.to'], bestbuy: ['bestbuy.com'], walmart: ['walmart.com'] };
+const LINK_STATUS = {
+  ok: ['checked ok', 'ok'],
+  unverified: ['not checked', ''],
+  suspect: ['suspect', 'warn'],
+  broken: ['broken (hidden)', 'error'],
+};
+const TRACKING_PARAM = /^(utm_|ref$|ref_$|tag$|linkCode$|linkId$|psc$|th$|pd_rd|pf_rd|content-id$|irclickid$|irgwc$|wmlspartner$|affiliates_ad_id$|campaign_id$|clickid$|sourceid$|veh$|sharedid$|acampid$|afsrc$|loc$|mpid$)/i;
+
+function isStoreUrl(url, retailer) {
+  if (typeof url !== 'string' || !/^https:\/\/[a-z0-9.-]+(:\d+)?([/?#]|$)/i.test(url)) return false;
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  const allowed = RETAILER_HOSTS[retailer.id] ?? [String(retailer.domain).toLowerCase()];
+  return allowed.some((domain) => host === domain || host.endsWith(`.${domain}`));
+}
+
+/**
+ * A pasted store address → the product id and a clean direct link (no tracking, no
+ * reviews/sku tails). Returns { error } when it isn't a product page of that store.
+ */
+function parseStoreUrl(raw, retailer) {
+  const text = String(raw || '').trim();
+  if (!text) return { error: 'Paste the product page address.' };
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return { error: 'That isn’t a web address.' };
+  }
+  if (url.protocol !== 'https:') return { error: 'The address must start with https://.' };
+  if (!isStoreUrl(url.href, retailer)) return { error: `That address isn’t on ${retailer.name}’s site.` };
+  const path = url.pathname;
+  if (retailer.id === 'amazon') {
+    if (/(^|\.)amzn\.to$/i.test(url.hostname)) return { error: 'Short amzn.to links can’t be read: open it and paste the full amazon.com address.' };
+    const asin = path.match(/\/(?:dp|gp\/product|gp\/aw\/d|clp|product)\/([A-Z0-9]{10})(?:[/?]|$)/i)?.[1];
+    if (!asin) return { error: 'Couldn’t find the product id (ASIN) in that Amazon address.' };
+    return { productId: asin.toUpperCase(), directUrl: `https://www.amazon.com/dp/${asin.toUpperCase()}` };
+  }
+  if (retailer.id === 'walmart') {
+    const id = path.match(/\/ip\/(?:[^/]+\/)?(\d{5,})(?:[/?]|$)/)?.[1];
+    if (!id) return { error: 'Couldn’t find the item number in that Walmart address (…/ip/…/123456789).' };
+    return { productId: id, directUrl: `https://www.walmart.com/ip/${id}` };
+  }
+  if (retailer.id === 'bestbuy') {
+    const modern = path.match(/^\/product\/([^/]+)\/([A-Z0-9]{8,})(?:\/|$)/i);
+    if (modern) return { productId: modern[2].toUpperCase(), directUrl: `https://www.bestbuy.com/product/${modern[1]}/${modern[2].toUpperCase()}` };
+    const sku = url.searchParams.get('skuId') || path.match(/\/(\d{7,})\.p$/)?.[1];
+    if (sku && /^\d{6,}$/.test(sku)) return { productId: sku, directUrl: `https://www.bestbuy.com/site/${sku}.p?skuId=${sku}` };
+    return { error: 'Couldn’t find the product id in that Best Buy address.' };
+  }
+  // Another store: keep the page, drop tracking parameters.
+  for (const key of [...url.searchParams.keys()]) if (TRACKING_PARAM.test(key)) url.searchParams.delete(key);
+  url.hash = '';
+  const last = path.split('/').filter(Boolean).pop();
+  if (!last) return { error: 'Paste a product page, not the store’s home page.' };
+  return { productId: last, directUrl: url.href };
+}
+
+/** An affiliate address: kept exactly as pasted (it carries the tracking), but it must be https and on the store's hosts. */
+function checkAffiliateUrl(raw, retailer) {
+  const text = String(raw || '').trim();
+  if (!text) return { url: null };
+  if (!isStoreUrl(text, retailer)) {
+    return { error: `The affiliate link for ${retailer.name} must be https and on ${(RETAILER_HOSTS[retailer.id] || [retailer.domain]).join(' or ')}. Add a new tracking host to RETAILER_HOSTS (app and data) first.` };
+  }
+  return { url: text };
+}
+
+function aliasOwners(catalogue) {
+  const map = new Map();
+  for (const entry of catalogue.amiibo) for (const alias of entry.aliases || []) map.set(alias, entry.id);
+  return map;
+}
+
+/** Links grouped by the amiibo's current id (a link added under a temporary id follows its alias). */
+function linksByAmiibo(file, catalogue) {
+  const aliases = aliasOwners(catalogue);
+  const map = new Map();
+  for (const item of file.links) {
+    const id = aliases.get(item.amiiboId) ?? item.amiiboId;
+    if (!map.has(id)) map.set(id, new Map());
+    map.get(id).set(item.retailerId, item);
+  }
+  return map;
+}
+
+async function loadLinks() {
+  const file = await fileJson(LINKS_FILE);
+  if (!file || !Array.isArray(file.links) || !Array.isArray(file.retailers)) throw new Error(`${LINKS_FILE} is missing or unreadable.`);
+  return file;
+}
+
+function linkStatusPill(item) {
+  if (!item) return pill('—');
+  const [text, kind] = LINK_STATUS[item.directStatus] || [item.directStatus, ''];
+  return pill(text, kind);
+}
+
+function linksText(file) {
+  return `${JSON.stringify(file, null, 2)}\n`;
+}
+
+async function showLinks(id) {
+  loading('Loading store links…');
+  const [catalogue, file] = await Promise.all([loadCatalogue(), loadLinks()]);
+  if (id) return showLinkEntry(decodeURIComponent(id), catalogue, file);
+  const byAmiibo = linksByAmiibo(file, catalogue);
+  const retailers = file.retailers;
+  const search = h('input', { type: 'search', placeholder: 'Search name, id, series…', autocomplete: 'off' });
+  const filter = h('select', {},
+    h('option', { value: 'recent' }, 'Figures from the last 2 years'),
+    h('option', { value: 'linked' }, 'With links'),
+    h('option', { value: 'gaps' }, 'With links, missing a store'),
+    h('option', { value: 'none' }, 'No links'),
+    h('option', { value: 'trouble' }, 'Suspect or broken'),
+    h('option', { value: 'all' }, 'All amiibo'));
+  const body = h('tbody');
+  const count = h('span', { class: 'muted small' });
+  const since = new Date(Date.now() - 2 * 365 * 86400000).toISOString().slice(0, 10);
+  const newest = (entry) => REGIONS.map((r) => entry.release[r]).filter(Boolean).sort()[0] || '';
+  const render = () => {
+    const q = search.value.trim().toLowerCase();
+    const matches = catalogue.amiibo.filter((entry) => {
+      const links = byAmiibo.get(entry.id);
+      const n = links ? links.size : 0;
+      if (filter.value === 'recent' && !(entry.type === 'Figure' && (entry.id.startsWith('ob-') || newest(entry) >= since))) return false;
+      if (filter.value === 'linked' && !n) return false;
+      if (filter.value === 'gaps' && !(n && n < retailers.length)) return false;
+      if (filter.value === 'none' && n) return false;
+      if (filter.value === 'trouble' && ![...(links?.values() || [])].some((item) => item.directStatus === 'suspect' || item.directStatus === 'broken')) return false;
+      if (!q) return true;
+      return `${entry.name} ${entry.id} ${entry.amiiboSeries} ${entry.gameSeries}`.toLowerCase().includes(q);
+    }).sort((a, b) => newest(b).localeCompare(newest(a)) || a.name.localeCompare(b.name));
+    const total = [...byAmiibo.values()].reduce((sum, links) => sum + links.size, 0);
+    count.textContent = `${matches.length} amiibo shown · ${total} links for ${byAmiibo.size} amiibo in all`;
+    body.replaceChildren(...matches.slice(0, 200).map((entry) => {
+      const links = byAmiibo.get(entry.id) || new Map();
+      return h('tr', { class: 'clickable', onclick: () => showTab(`links/${encodeURIComponent(entry.id)}`, entry.id) },
+        h('td', {}, amiiboImage(entry)),
+        h('td', {}, h('strong', {}, entry.name), h('div', { class: 'small muted' }, `${entry.amiiboSeries} · ${newest(entry) || 'no date'}`)),
+        ...retailers.map((retailer) => h('td', {}, h('div', { class: 'small muted' }, retailer.name), linkStatusPill(links.get(retailer.id)))));
+    }));
+  };
+  search.addEventListener('input', render);
+  filter.addEventListener('change', render);
+  view(
+    h('div', { class: 'card stack' },
+      h('h2', {}, 'Store links'),
+      h('p', { class: 'small muted' }, 'The “Where to buy” buttons in the app. Pick an amiibo to add, change or remove its links; every change opens a pull request you merge in Review. The weekly check marks a link suspect after one failed check and broken (hidden in the app) after two; stores often block the check, which changes nothing.'),
+      h('div', { class: 'row' }, h('div', { class: 'grow' }, search), h('div', {}, filter)),
+      h('div', { class: 'row spread' }, count,
+        h('button', { type: 'button', class: 'ghost', onclick: () => { state.catalogue = null; showTab('links'); } }, 'Reload'))),
+    h('div', { class: 'card table-wrap' }, h('table', {}, body)),
+  );
+  render();
+  search.focus();
+}
+
+function showLinkEntry(id, catalogue, file) {
+  const entry = catalogue.amiibo.find((item) => item.id === id);
+  if (!entry) throw new Error(`No amiibo with id ${id}.`);
+  const current = linksByAmiibo(file, catalogue).get(entry.id) || new Map();
+  const forms = file.retailers.map((retailer) => {
+    const item = current.get(retailer.id) || null;
+    const direct = h('input', { value: item?.directUrl || '', placeholder: `Paste the ${retailer.name} product page`, autocomplete: 'off', spellcheck: 'false' });
+    const affiliate = h('input', { value: item?.affiliateUrl || '', placeholder: 'Affiliate link (optional, once the program approves)', autocomplete: 'off', spellcheck: 'false' });
+    const remove = item ? h('input', { type: 'checkbox' }) : null;
+    const parsed = h('div', { class: 'small muted' });
+    const showParsed = () => {
+      if (!direct.value.trim()) return (parsed.textContent = item ? 'Empty: tick “Remove” to delete this link.' : '');
+      const result = parseStoreUrl(direct.value, retailer);
+      parsed.replaceChildren(result.error ? h('span', { class: 'error' }, result.error) : h('span', {}, 'Saves as ', link(result.directUrl, result.directUrl), ` · product id ${result.productId}`));
+    };
+    direct.addEventListener('input', showParsed);
+    showParsed();
+    const node = h('div', { class: 'card stack' },
+      h('div', { class: 'row spread' },
+        h('h3', {}, retailer.name),
+        item ? h('div', { class: 'row small' }, linkStatusPill(item), item.verifiedAt ? h('span', { class: 'muted' }, `last ok ${item.verifiedAt}`) : null) : pill('no link')),
+      item ? h('div', { class: 'small' }, 'Now: ', link(item.directUrl, item.directUrl), item.affiliateUrl ? h('div', {}, 'Affiliate: ', link(item.affiliateUrl, item.affiliateUrl), ' ', linkStatusPill({ directStatus: item.affiliateStatus })) : null) : null,
+      h('label', {}, 'Product page', direct), parsed,
+      h('label', {}, 'Affiliate link', affiliate),
+      remove ? h('label', { class: 'check' }, remove, `Remove the ${retailer.name} link`) : null);
+    return { retailer, item, direct, affiliate, remove, node };
+  });
+
+  const propose = async () => {
+    const problems = [];
+    const changes = [];
+    for (const form of forms) {
+      const { retailer, item } = form;
+      if (form.remove?.checked) {
+        changes.push({ retailer, kind: 'removed', before: item, after: null });
+        continue;
+      }
+      const directText = form.direct.value.trim();
+      const affiliateText = form.affiliate.value.trim();
+      if (!directText) {
+        if (affiliateText) problems.push(`${retailer.name}: add the product page too.`);
+        continue;
+      }
+      const parsed = parseStoreUrl(directText, retailer);
+      if (parsed.error) { problems.push(`${retailer.name}: ${parsed.error}`); continue; }
+      const aff = checkAffiliateUrl(affiliateText, retailer);
+      if (aff.error) { problems.push(`${retailer.name}: ${aff.error}`); continue; }
+      if (item && item.directUrl === parsed.directUrl && (item.affiliateUrl || null) === aff.url) continue;
+      const after = {
+        amiiboId: item?.amiiboId || entry.id,
+        retailerId: retailer.id,
+        productId: parsed.productId,
+        directUrl: parsed.directUrl,
+        affiliateUrl: aff.url,
+        directStatus: item && item.directUrl === parsed.directUrl ? item.directStatus : 'unverified',
+        affiliateStatus: item && item.affiliateUrl === aff.url ? item.affiliateStatus : 'unverified',
+        verifiedAt: item && item.directUrl === parsed.directUrl ? item.verifiedAt : null,
+        method: 'manual',
+      };
+      changes.push({ retailer, kind: item ? 'changed' : 'added', before: item, after });
+    }
+    if (problems.length) return toast(problems.join(' '), true);
+    if (!changes.length) return toast('Nothing changed.');
+    const lines = changes.map(({ retailer, kind, before, after }) => (kind === 'added'
+      ? `${retailer.name}: new ${after.directUrl}${after.affiliateUrl ? ` (affiliate ${after.affiliateUrl})` : ''}`
+      : kind === 'removed'
+        ? `${retailer.name}: remove ${before.directUrl}`
+        : `${retailer.name}: ${before.directUrl === after.directUrl ? '' : `${before.directUrl} → ${after.directUrl}`}${(before.affiliateUrl || null) !== after.affiliateUrl ? `${before.directUrl === after.directUrl ? '' : '; '}affiliate ${before.affiliateUrl || '(none)'} → ${after.affiliateUrl || '(none)'}` : ''}`));
+    const changesExisting = changes.some((change) => change.kind === 'changed'
+      && (change.before.directUrl !== change.after.directUrl || (change.before.affiliateUrl && change.before.affiliateUrl !== change.after.affiliateUrl)));
+    const removes = changes.some((change) => change.kind === 'removed');
+    const labels = [changesExisting && 'allow-changes', removes && 'allow-removals'].filter(Boolean);
+    if (!(await confirmDialog(`Propose store links for ${entry.name}?`, [h('pre', {}, lines.join('\n')), labels.length ? `Labels so the Guard accepts it: ${labels.join(', ')}.` : 'Only adds links.'], 'Open pull request'))) return;
+    try {
+      const fresh = await loadLinks(); // edit the latest main, not the copy loaded earlier
+      const freshById = linksByAmiibo(fresh, catalogue).get(entry.id) || new Map();
+      for (const change of changes) {
+        const existing = freshById.get(change.retailer.id);
+        if (change.kind === 'added' && existing) throw new Error(`${change.retailer.name} already has a link now. Reload and try again.`);
+        if (change.kind !== 'added' && (!existing || existing.directUrl !== change.before.directUrl)) throw new Error(`The ${change.retailer.name} link changed since you opened this page. Reload and try again.`);
+        if (change.kind === 'removed') fresh.links.splice(fresh.links.indexOf(existing), 1);
+        else if (change.kind === 'changed') fresh.links[fresh.links.indexOf(existing)] = change.after;
+        else fresh.links.push(change.after);
+      }
+      const pr = await proposeChange({
+        branch: `admin/links-${entry.id}-${stamp()}`,
+        title: `Store links for ${entry.name}`,
+        body: `Edited in the dashboard by @${state.user.login}.\n\n${lines.map((line) => `- ${line}`).join('\n')}`,
+        files: [{ path: LINKS_FILE, text: linksText(fresh) }],
+        labels,
+      });
+      toast(`Opened #${pr.number}. Merge it in Review.`);
+      showTab('review');
+    } catch (error) {
+      toast(`Couldn’t open the pull request: ${error.message}`, true);
+    }
+  };
+
+  view(
+    h('div', { class: 'card' },
+      h('div', { class: 'row spread' },
+        h('div', { class: 'row' }, amiiboImage(entry, 'big-thumb'),
+          h('div', {}, h('h2', {}, entry.name), h('code', {}, entry.id),
+            h('div', { class: 'small muted' }, `${entry.amiiboSeries} · ${entry.type}`))),
+        h('button', { type: 'button', class: 'ghost', onclick: () => showTab('links') }, 'Back')),
+      h('p', { class: 'small muted' }, 'Paste the store’s own product page for the official Nintendo product (not a reseller or import listing). Tracking and review tails are removed; the product id is read from the address.')),
+    ...forms.map((form) => form.node),
+    h('div', { class: 'card row' },
+      h('button', { type: 'button', onclick: propose }, 'Propose these changes'),
+      h('span', { class: 'small muted' }, 'Opens a pull request. Nothing goes live until you merge it in Review.')),
+  );
+}
+
+/** What a pull request does to the store links: added, changed and removed, per amiibo and store. */
+async function prLinkChanges(pr) {
+  const compare = await gh(repoPath(`/compare/main...${pr.head.sha}?per_page=1`));
+  const baseSha = compare.merge_base_commit.sha;
+  const [base, head, catalogue] = await Promise.all([
+    fileJson(LINKS_FILE, baseSha),
+    fileJson(LINKS_FILE, pr.head.sha),
+    fileJson('data/catalogue.json', pr.head.sha),
+  ]);
+  return diffLinks(base || { links: [] }, head || { links: [] }, catalogue || { amiibo: [] });
+}
+
+function diffLinks(base, head, catalogue) {
+  const key = (item) => `${item.amiiboId}/${item.retailerId}`;
+  const before = new Map(base.links.map((item) => [key(item), item]));
+  const after = new Map(head.links.map((item) => [key(item), item]));
+  const aliases = aliasOwners(catalogue);
+  const byId = new Map(catalogue.amiibo.map((entry) => [entry.id, entry]));
+  const stores = new Map([...(base.retailers || []), ...(head.retailers || [])].map((retailer) => [retailer.id, retailer.name]));
+  const rows = [];
+  for (const [k, item] of after) {
+    const old = before.get(k);
+    if (!old) rows.push({ kind: 'added', item, old: null });
+    else if (old.directUrl !== item.directUrl || (old.affiliateUrl || null) !== (item.affiliateUrl || null)) rows.push({ kind: 'changed', item, old });
+  }
+  for (const [k, old] of before) if (!after.has(k)) rows.push({ kind: 'removed', item: null, old });
+  for (const row of rows) {
+    const id = (row.item || row.old).amiiboId;
+    row.entry = byId.get(aliases.get(id) ?? id) || null;
+    row.store = stores.get((row.item || row.old).retailerId) || (row.item || row.old).retailerId;
+  }
+  rows.sort((a, b) => (a.entry?.name || '').localeCompare(b.entry?.name || '') || a.store.localeCompare(b.store));
+  return rows;
+}
+
+function linkChangesView(rows) {
+  const kinds = { added: ['New', 'ok'], changed: ['Changed', 'warn'], removed: ['Removed', 'error'] };
+  const urls = (item) => (item
+    ? h('div', { class: 'small' }, link(item.directUrl, item.directUrl), item.affiliateUrl ? h('div', {}, 'affiliate: ', link(item.affiliateUrl, item.affiliateUrl)) : null)
+    : h('span', { class: 'muted small' }, '—'));
+  return h('div', { class: 'table-wrap' }, h('table', {},
+    h('thead', {}, h('tr', {}, h('th', {}, ''), h('th', {}, 'Amiibo'), h('th', {}, 'Store'), h('th', {}, 'Now'), h('th', {}, 'After merge'))),
+    h('tbody', {}, rows.map((row) => h('tr', {},
+      h('td', {}, pill(...kinds[row.kind])),
+      h('td', {}, row.entry ? h('div', { class: 'row' }, amiiboImage(row.entry), h('div', {}, h('strong', {}, row.entry.name), h('div', { class: 'small muted' }, row.entry.amiiboSeries))) : h('code', {}, (row.item || row.old).amiiboId)),
+      h('td', {}, row.store),
+      h('td', {}, urls(row.old)),
+      h('td', {}, urls(row.item)))))));
 }

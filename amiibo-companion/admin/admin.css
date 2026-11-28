@@ -222,3 +222,4 @@ input.hex { width: 96px; margin: 0; font-family: ui-monospace, monospace; text-t
 .label { font-size: 14px; font-weight: 600; color: var(--muted); }
 .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .pair label { margin: 0; }
+.inline-date { width: auto; }
